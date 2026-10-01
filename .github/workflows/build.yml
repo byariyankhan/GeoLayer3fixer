@@ -52,6 +52,13 @@ jobs:
         shell: bash
         run: echo "v=$(python -c 'import geolayer_fixer; print(geolayer_fixer.__version__)')" >> "$GITHUB_OUTPUT"
 
+      # Keep the version tag on the commit that produced this exe
+      - name: Move tag to this commit
+        shell: bash
+        run: |
+          git tag -f "v${{ steps.ver.outputs.v }}"
+          git push -f origin "v${{ steps.ver.outputs.v }}"
+
       # Every push to main publishes/updates the release for the current version
       - name: Release
         uses: softprops/action-gh-release@v2
