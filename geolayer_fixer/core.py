@@ -264,15 +264,64 @@ def is_incomplete(problems: list[str]) -> bool:
     return any(k in pr for pr in problems for k in _INCOMPLETE)
 
 
+def app_dir() -> Path:
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return Path(base) / "GeoLayerFixer"
+
+
+def quarantine_dir() -> Path:
+    """Quarantine lives OUTSIDE the watched GEOlayers folders, so moved tiles
+    are never picked up and re-processed (that caused an endless loop)."""
+    return app_dir() / "quarantine"
+
+
+# Folder names never scanned/watched (old v1/gl-patch quarantine included)
+SKIP_DIR_NAMES = {"corrupt_tiles_quarantine", "quarantine", "__pycache__"}
+
+
+def is_excluded(path: str | os.PathLike) -> bool:
+    parts = {x.lower() for x in Path(path).parts}
+    if parts & SKIP_DIR_NAMES:
+        return True
+    try:
+        Path(path).resolve().relative_to(app_dir().resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def clean_quarantine(days: float = 7) -> int:
+    """Delete quarantined tiles older than `days`. Returns number removed."""
+    q = quarantine_dir()
+    if not q.is_dir():
+        return 0
+    cutoff = time.time() - days * 86400
+    n = 0
+    for f in q.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
 def quarantine(path: Path, qdir: Path) -> str:
     qdir.mkdir(parents=True, exist_ok=True)
-    dest = qdir / f"{int(time.time())}_{path.name}"
-    os.replace(path, dest)
+    dest = qdir / f"{int(time.time() * 1000)}_{path.name}"
+    try:
+        os.replace(path, dest)
+    except OSError:
+        # Different drive -> copy + delete
+        import shutil
+        shutil.move(str(path), str(dest))
+    os.utime(dest)  # age counts from quarantine time
     return str(dest)
 
 
 def process_file(path: str, force: bool = False, dry_run: bool = False,
-                 wait_stable: float = 0.0, quarantine_dir: str | None = None) -> Result:
+                 wait_stable: float = 0.0, quarantine_to: str | None = None) -> Result:
     """Inspect one PNG and repair it if needed. Safe to run in a worker process.
 
     status: ok | repaired | reencoded | quarantined | failed | skipped
@@ -295,7 +344,7 @@ def process_file(path: str, force: bool = False, dry_run: bool = False,
         return Result(path, "failed" if problems else "ok", problems, "(scan only)")
 
     if is_incomplete(problems):
-        qdir = Path(quarantine_dir) if quarantine_dir else p.parent.parent / "corrupt_tiles_quarantine"
+        qdir = Path(quarantine_to) if quarantine_to else quarantine_dir()
         try:
             dest = quarantine(p, qdir)
         except OSError as e:
@@ -325,28 +374,35 @@ def process_file(path: str, force: bool = False, dry_run: bool = False,
     return Result(path, "failed", problems, "could not rebuild - delete this tile so GEOlayers re-downloads it")
 
 
+_NOT_PNG_EXT = (".json", ".txt", ".log", ".jpg", ".jpeg", ".webp", ".pbf", ".mvt",
+                ".tif", ".tiff", ".zip", ".jsx", ".aep", ".aet", ".lic", ".shp", ".dbf")
+
+
 def iter_pngs(folders: list[str], since: float = 0.0):
-    """Yield every PNG under the given folders (by signature, any extension)."""
+    """Yield every PNG under the given folders (by signature, any extension).
+    Quarantine folders and the app's own folder are skipped."""
+    seen = set()
     for folder in folders:
         root = Path(os.path.expandvars(folder))
-        if not root.is_dir():
+        if not root.is_dir() or is_excluded(root):
             continue
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIR_NAMES]
             for name in files:
-                if name.endswith(".glfix.tmp"):
+                low = name.lower()
+                if low.endswith(".glfix.tmp") or low.endswith(_NOT_PNG_EXT):
                     continue
                 fp = os.path.join(dirpath, name)
-                low = name.lower()
+                if fp in seen:
+                    continue
                 if since:
                     try:
                         if os.path.getmtime(fp) < since:
                             continue
                     except OSError:
                         continue
-                if low.endswith(".png") or ("." not in name and is_png_file(fp)):
-                    yield fp
-                elif not low.endswith((".json", ".txt", ".log", ".jpg", ".jpeg",
-                                       ".webp", ".pbf", ".mvt", ".tif", ".tiff")) and is_png_file(fp):
+                if low.endswith(".png") or is_png_file(fp):
+                    seen.add(fp)
                     yield fp
 
 

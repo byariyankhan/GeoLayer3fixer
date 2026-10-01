@@ -80,7 +80,14 @@ def test_clean_png_has_no_problems():
     assert inspect_bytes(make_png()) == []
 
 
-def test_truncated_is_quarantined_not_padded(tmp_path):
+@pytest.fixture(autouse=True)
+def isolated_appdata(tmp_path, monkeypatch):
+    """Quarantine + cache go to APPDATA\\GeoLayerFixer: keep tests isolated."""
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    return tmp_path / "appdata" / "GeoLayerFixer"
+
+
+def test_truncated_is_quarantined_not_padded(tmp_path, isolated_appdata):
     tiles = tmp_path / "tiles"
     tiles.mkdir()
     f = tiles / "t.png"
@@ -88,7 +95,7 @@ def test_truncated_is_quarantined_not_padded(tmp_path):
     r = process_file(str(f))
     assert r.status == "quarantined", r
     assert not f.exists()
-    assert len(list((tmp_path / "corrupt_tiles_quarantine").iterdir())) == 1
+    assert len(list((isolated_appdata / "quarantine").iterdir())) == 1
 
 
 def zero_len_idat(data):

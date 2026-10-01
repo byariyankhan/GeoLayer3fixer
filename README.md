@@ -13,7 +13,7 @@ PNGIO library error: IDAT: CRC error (5027 :: 12)
 |---|---|
 | Wrong CRC, pixel data intact | Rebuilt losslessly |
 | Bad filter byte (> 4) in some rows | Rebuilt; only those rows change |
-| Half-written / cut-off / corrupt stream | **Moved to `corrupt_tiles_quarantine`** so GEOlayers downloads it again (never padded with black rows) |
+| Half-written / cut-off / corrupt stream | **Moved to quarantine** so GEOlayers downloads it again (never padded with black rows) |
 | Clean tile | **Not touched** (unless *Force* is on) |
 
 * Checks PNGs exactly where AE's libpng fails: chunk CRCs, every scanline's filter byte, truncation.
@@ -21,6 +21,12 @@ PNGIO library error: IDAT: CRC error (5027 :: 12)
 * Writes atomically (temp file + replace), so After Effects never reads a half-written file.
 * Uses every CPU core (process pool) with optional high priority. GPU is not used — PNG decode/encode is CPU work.
 * Watcher waits until GEOlayers finishes writing before checking a tile, and never rewrites clean tiles (no fix-loop).
+* Watcher also re-scans recently changed tiles every 45 s, in case Windows drops change notifications.
+* Tiles verified clean are remembered (size + modified time), so repeat runs of **Fix Tiles Now** only check new/changed tiles.
+* Worker count adapts to free RAM (a 4096px tile needs ~600 MB while being fixed), leaving room for After Effects.
+* Quarantine is kept in `%APPDATA%\GeoLayerFixer\quarantine` (outside the watched folders) and auto-cleaned after 7 days.
+* Only one copy can run at a time; an old *Start with Windows* entry pointing at v1 is switched to this version.
+* Shows a notice when a newer release is available.
 
 ## Use
 

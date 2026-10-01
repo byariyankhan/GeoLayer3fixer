@@ -14,14 +14,16 @@ from tkinter import filedialog
 import customtkinter as ctk
 
 from . import __version__
-from .core import default_folders
-from .runner import Watcher, run_batch, set_high_priority
+from .core import app_dir, clean_quarantine, default_folders, quarantine_dir
+from .runner import VerifiedCache, Watcher, pick_workers, run_batch, set_high_priority
 
-APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GeoLayerFixer")
+APP_DIR = str(app_dir())
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 LOG_FILE = os.path.join(APP_DIR, "geolayer_fixer.log")
 REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REG_NAME = "GeoLayer3Fixer"
+REPO = "byariyankhan/GeoLayer3fixer"
+RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 
 C_BG, C_CARD = "#1A1A2E", "#16213E"
 C_GREEN, C_RED, C_ORANGE, C_BLUE, C_GRAY = "#1DB954", "#E74C3C", "#F39C12", "#0078D4", "#888888"
@@ -56,14 +58,60 @@ def _exe_cmd() -> str:
     return f'"{sys.executable}" -m geolayer_fixer --minimized'
 
 
-def is_autostart() -> bool:
+def autostart_value() -> str | None:
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY) as k:
-            winreg.QueryValueEx(k, REG_NAME)
-        return True
+            return winreg.QueryValueEx(k, REG_NAME)[0]
     except Exception:
-        return False
+        return None
+
+
+def is_autostart() -> bool:
+    return autostart_value() is not None
+
+
+def repoint_old_autostart() -> str | None:
+    """If 'Start with Windows' still launches an old fixer (v1 or another copy),
+    point it at this exe. The old v1 rewrote tiles in a loop and caused the
+    very AE errors we are fixing, so it must never start again."""
+    if not getattr(sys, "frozen", False):
+        return None
+    val = autostart_value()
+    if val and os.path.normcase(sys.executable) not in os.path.normcase(val):
+        set_autostart(True)
+        return val
+    return None
+
+
+def acquire_single_instance():
+    """Windows named mutex: only one GeoLayer Fixer may run (two copies would
+    fight over the same tiles). Returns handle, or None if already running."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    h = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\GeoLayerFixerV2")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        return None
+    return h
+
+
+def latest_release_version(timeout=5.0) -> str | None:
+    import urllib.request
+    req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                 headers={"User-Agent": "GeoLayerFixer"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r).get("tag_name", "").lstrip("v") or None
+
+
+def _vtuple(v: str):
+    out = []
+    for x in v.split("."):
+        try:
+            out.append(int(x))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
 
 
 def set_autostart(on: bool) -> None:
@@ -93,20 +141,37 @@ class App(ctk.CTk):
         self.configure(fg_color=C_BG)
         self._ui_q: queue.Queue = queue.Queue()
         self._watcher: Watcher | None = None
+        self._cache = VerifiedCache()
         self._cancel = threading.Event()
         self._busy = False
-        self._watch_counts = {"repaired": 0, "failed": 0}
+        self._watch_counts = {"repaired": 0, "quarantined": 0, "failed": 0}
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._pump)
-        self._log(f"GeoLayer Fixer v{__version__} - {os.cpu_count()} CPU threads available")
+        self._log(f"GeoLayer Fixer v{__version__} - {os.cpu_count()} CPU threads, "
+                  f"using up to {pick_workers()} workers")
+        old = repoint_old_autostart()
+        if old:
+            self._log(f"Start-with-Windows was launching an old fixer ({old}). Switched it to this version.")
+        removed = clean_quarantine(days=7)
+        if removed:
+            self._log(f"Deleted {removed} quarantined tile(s) older than 7 days.")
         for f in self.cfg["folders"]:
             exists = os.path.isdir(os.path.expandvars(f))
             self._log(f"Folder: {f}" + ("" if exists else "  (NOT FOUND!)"))
         if self.cfg.get("watch_on_start"):
             self._toggle_watch()
+        threading.Thread(target=self._check_update, daemon=True).start()
         if minimized:
             self.iconify()
+
+    def _check_update(self):
+        try:
+            latest = latest_release_version()
+        except Exception:
+            return
+        if latest and _vtuple(latest) > _vtuple(__version__):
+            self._ui_q.put(("update", latest))
 
     # ---------------- UI ----------------
     def _card(self, title, subtitle=None):
@@ -122,7 +187,10 @@ class App(ctk.CTk):
     def _build(self):
         ctk.CTkLabel(self, text="GeoLayer Fixer", font=ctk.CTkFont(size=24, weight="bold"),
                      text_color="white").pack(pady=(14, 0))
-        ctk.CTkLabel(self, text="After Effects 2025/2026 PNG Fix  •  v2", text_color=C_GRAY).pack()
+        ctk.CTkLabel(self, text=f"After Effects 2025/2026 PNG Fix  •  v{__version__}", text_color=C_GRAY).pack()
+        self.update_lbl = ctk.CTkLabel(self, text="", text_color=C_ORANGE, cursor="hand2")
+        self.update_lbl.pack()
+        self.update_lbl.bind("<Button-1>", lambda _e: __import__("webbrowser").open(RELEASES_URL))
 
         # Folders
         c = self._card("Tile Folders", "All subfolders are scanned. PNGs are detected by content, not extension.")
@@ -137,6 +205,8 @@ class App(ctk.CTk):
                       command=self._reset_folders).pack(side="left", padx=6)
         ctk.CTkButton(row, text="Open folder", width=100, fg_color="#333355",
                       command=self._open_folder).pack(side="left")
+        ctk.CTkButton(row, text="Quarantine", width=100, fg_color="#333355",
+                      command=self._open_quarantine).pack(side="left", padx=6)
 
         # Watcher
         c = self._card("Auto Watcher", "Checks every tile GEOlayers writes and repairs broken ones instantly.")
@@ -144,7 +214,7 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=16, pady=6)
         self.watch_dot = ctk.CTkLabel(row, text="● Inactive", text_color=C_RED)
         self.watch_dot.pack(side="left")
-        self.watch_count = ctk.CTkLabel(row, text="Repaired: 0   Failed: 0", text_color=C_GRAY)
+        self.watch_count = ctk.CTkLabel(row, text=self._watch_text(), text_color=C_GRAY)
         self.watch_count.pack(side="right")
         self.watch_btn = ctk.CTkButton(c, text="Activate Watcher", height=38, fg_color=C_GREEN,
                                        hover_color="#17a045", command=self._toggle_watch)
@@ -196,13 +266,24 @@ class App(ctk.CTk):
                     done, total = val
                     self.progress.set(done / total if total else 1)
                 elif kind == "watchcount":
-                    self.watch_count.configure(
-                        text=f"Repaired: {self._watch_counts['repaired']}   Failed: {self._watch_counts['failed']}")
+                    self.watch_count.configure(text=self._watch_text())
+                elif kind == "update":
+                    self.update_lbl.configure(text=f"⬆ Update available: v{val} — click to download")
                 elif kind == "done":
                     self._finish(val)
         except queue.Empty:
             pass
         self.after(100, self._pump)
+
+    def _watch_text(self):
+        c = self._watch_counts
+        return f"Repaired: {c['repaired']}   Quarantined: {c['quarantined']}   Failed: {c['failed']}"
+
+    def _open_quarantine(self):
+        q = quarantine_dir()
+        q.mkdir(parents=True, exist_ok=True)
+        if hasattr(os, "startfile"):
+            os.startfile(str(q))
 
     def _refresh_folders(self):
         self.folder_box.configure(state="normal")
@@ -240,10 +321,13 @@ class App(ctk.CTk):
 
     # ---------------- watcher ----------------
     def _on_watch_result(self, r):
-        self._watch_counts["repaired" if r.status == "repaired" else "failed"] += 1
+        key = r.status if r.status in self._watch_counts else "failed"
+        self._watch_counts[key] += 1
         name = os.path.basename(r.path)
         if r.status == "repaired":
             self._log(f"[watch] FIXED {name}: {'; '.join(r.problems)}")
+        elif r.status == "quarantined":
+            self._log(f"[watch] QUARANTINED {name} (incomplete) - GEOlayers will re-download it")
         else:
             self._log(f"[watch] FAILED {name}: {r.message} ({'; '.join(r.problems)})")
         self._ui_q.put(("watchcount", None))
@@ -258,7 +342,7 @@ class App(ctk.CTk):
             self._log("Watcher stopped.")
         else:
             try:
-                self._watcher = Watcher(self.cfg["folders"], self._on_watch_result)
+                self._watcher = Watcher(self.cfg["folders"], self._on_watch_result, cache=self._cache)
                 self._watcher.start()
             except Exception as e:
                 self._watcher = None
@@ -292,6 +376,8 @@ class App(ctk.CTk):
             name = os.path.basename(r.path)
             if r.status == "repaired":
                 self._log(f"FIXED  {name}: {'; '.join(r.problems)}")
+            elif r.status == "quarantined":
+                self._log(f"QUARANTINED {name}: {'; '.join(r.problems)}")
             elif r.status == "failed":
                 self._log(f"BROKEN {name}: {'; '.join(r.problems)} {r.message}")
 
@@ -300,7 +386,7 @@ class App(ctk.CTk):
                 stats = run_batch(self.cfg["folders"], force=force, dry_run=dry,
                                   high_priority=self.prio_var.get(), on_result=on_result,
                                   on_progress=lambda d, t: self._ui_q.put(("progress", (d, t))),
-                                  cancel=self._cancel)
+                                  cancel=self._cancel, cache=self._cache)
             except Exception as e:
                 stats = None
                 self._log(f"Error: {e}")
@@ -313,25 +399,32 @@ class App(ctk.CTk):
         self._busy = False
         self.scan_btn.configure(text="Scan Only", fg_color="#444477")
         self.fix_btn.configure(text="Fix Tiles Now", fg_color=C_BLUE)
+        self.progress.set(1)
         if stats is None:
             return
         total = sum(stats.values())
         if total == 0:
             self._log("No PNG tiles found! Check the folder list - GEOlayers may store tiles elsewhere.")
             return
+        clean = stats["ok"] + stats["cached"]
         if dry:
-            self._log(f"Scan done: {total} tiles, {stats['ok']} clean, {stats['failed']} BROKEN.")
+            self._log(f"Scan done: {total} tiles | clean {clean} (already verified {stats['cached']}) | "
+                      f"BROKEN {stats['failed']}")
         else:
-            self._log(f"Done: {total} tiles | clean {stats['ok']} | repaired {stats['repaired']} | "
-                      f"re-encoded {stats['reencoded']} | failed {stats['failed']} | skipped {stats['skipped']}")
+            self._log(f"Done: {total} tiles | clean {clean} (already verified {stats['cached']}) | "
+                      f"repaired {stats['repaired']} | re-encoded {stats['reencoded']} | "
+                      f"quarantined {stats['quarantined']} | failed {stats['failed']} | skipped {stats['skipped']}")
+            if stats["quarantined"]:
+                self._log("Quarantined tiles were incomplete. Re-open/finalize the map so GEOlayers downloads them again.")
             if stats["failed"]:
-                self._log("Failed tiles can't be rebuilt: delete them and let GEOlayers re-download.")
+                self._log("Failed tiles could not be fixed: delete them and let GEOlayers re-download.")
             self._log("Now in AE: Edit > Purge > All Memory & Disk Cache, then render.")
 
     def _close(self):
         self._cancel.set()
         if self._watcher:
             self._watcher.stop()
+        self._cache.save()
         self.destroy()
 
 
@@ -347,6 +440,20 @@ def main():
     if args and args[0] in ("--scan", "--fix"):
         from .cli import main as cli_main
         sys.exit(cli_main(args))
+    global _MUTEX
+    _MUTEX = acquire_single_instance()
+    if _MUTEX is None:
+        if "--minimized" not in args:
+            from tkinter import Tk, messagebox
+            r = Tk()
+            r.withdraw()
+            messagebox.showinfo("GeoLayer Fixer", "GeoLayer Fixer is already running.\n"
+                                "Check the taskbar - only one copy may run at a time.")
+            r.destroy()
+        return
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     App(minimized="--minimized" in args).mainloop()
+
+
+_MUTEX = None
