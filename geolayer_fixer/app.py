@@ -28,12 +28,18 @@ RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 C_BG, C_CARD = "#1A1A2E", "#16213E"
 C_GREEN, C_RED, C_ORANGE, C_BLUE, C_GRAY = "#1DB954", "#E74C3C", "#F39C12", "#0078D4", "#888888"
 
-os.makedirs(APP_DIR, exist_ok=True)
 log = logging.getLogger("glfix")
-log.setLevel(logging.INFO)
-_fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-log.addHandler(_fh)
+
+
+def _setup_logging() -> None:
+    """Only the GUI process writes the log (not worker processes)."""
+    if log.handlers:
+        return
+    os.makedirs(APP_DIR, exist_ok=True)
+    log.setLevel(logging.INFO)
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    log.addHandler(fh)
 
 
 def load_config() -> dict:
@@ -48,6 +54,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    os.makedirs(APP_DIR, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -451,6 +458,7 @@ def main():
                                 "Check the taskbar - only one copy may run at a time.")
             r.destroy()
         return
+    _setup_logging()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     App(minimized="--minimized" in args).mainloop()

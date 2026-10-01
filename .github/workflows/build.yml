@@ -35,12 +35,15 @@ jobs:
           --hidden-import watchdog.observers.read_directory_changes
           run.py
 
-      - name: Smoke test (CLI scan of empty folder)
+      - name: Smoke test exe (30 real tiles, multi-process path)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path smoke | Out-Null
-          $p = Start-Process dist\GeoLayer_Fixer.exe -ArgumentList "--scan","smoke" -Wait -PassThru
+          python tests/smoke_exe.py make smoke
+          $p = Start-Process dist\GeoLayer_Fixer.exe -ArgumentList "--fix","smoke" -Wait -PassThru
+          Write-Host "exe exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
+          python tests/smoke_exe.py check smoke
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - uses: actions/upload-artifact@v4
         with:

@@ -9,16 +9,22 @@ PNGIO library error: IDAT: CRC error (5027 :: 12)
 
 ## What it does
 
+**Rule: only repairs that keep every pixel identical. Anything else is re-downloaded.**
+
 | Problem in tile | Action |
 |---|---|
-| Wrong CRC, pixel data intact | Rebuilt losslessly |
-| Bad filter byte (> 4) in some rows | Rebuilt; only those rows change |
-| Half-written / cut-off / corrupt stream | **Moved to quarantine** so GEOlayers downloads it again (never padded with black rows) |
+| Wrong CRC, data after the image, split IDAT chunks | Rebuilt losslessly (pixels verified byte-identical) |
+| Bad filter byte, corrupt / half-written / cut-off data | **Moved to quarantine** so GEOlayers downloads a correct copy |
 | Clean tile | **Not touched** (unless *Force* is on) |
+
+Why bad filter bytes are not "patched": the error spreads to following rows
+through the Up/Average/Paeth filters. On a real 4096px GEOlayers tile, 9 broken
+rows became 217 visibly wrong rows after patching — stripes in the map.
 
 * Checks PNGs exactly where AE's libpng fails: chunk CRCs, every scanline's filter byte, truncation.
 * Detects PNGs by signature, scans all subfolders.
 * Writes atomically (temp file + replace), so After Effects never reads a half-written file.
+* If GEOlayers rewrites a tile while it is being fixed, the fix is dropped and the new tile is kept.
 * Uses every CPU core (process pool) with optional high priority. GPU is not used — PNG decode/encode is CPU work.
 * Watcher waits until GEOlayers finishes writing before checking a tile, and never rewrites clean tiles (no fix-loop).
 * Watcher also re-scans recently changed tiles every 45 s, in case Windows drops change notifications.

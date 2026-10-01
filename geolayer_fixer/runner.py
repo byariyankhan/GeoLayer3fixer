@@ -11,8 +11,8 @@ import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-from .core import (Result, app_dir, is_excluded, is_incomplete, is_png_file,
-                   iter_pngs, process_file)
+from .core import (Result, app_dir, clean_quarantine, is_excluded, is_png_file,
+                   iter_pngs, needs_redownload, process_file)
 
 HIGH_PRIORITY_CLASS = 0x00000080
 # Peak RAM one worker can need for a 4096x4096 RGBA tile (raw + rebuilt + zlib)
@@ -85,27 +85,27 @@ class VerifiedCache:
             self.data = {}
 
     @staticmethod
-    def _sig(path):
-        st = os.stat(path)
-        return [st.st_size, st.st_mtime_ns]
+    def _key(path):
+        return os.path.normcase(os.path.abspath(path))
 
     def is_clean(self, path) -> bool:
         try:
-            return self.data.get(path) == self._sig(path)
+            st = os.stat(path)
         except OSError:
             return False
+        return self.data.get(self._key(path)) == [st.st_size, st.st_mtime_ns]
 
-    def mark_clean(self, path):
-        try:
-            sig = self._sig(path)
-        except OSError:
+    def mark_clean(self, path, sig):
+        """`sig` = (size, mtime_ns) of the content that was actually verified.
+        If the file changed since, the entry simply won't match -> re-checked."""
+        if not sig:
             return
         with self._lock:
-            self.data[path] = sig
+            self.data[self._key(path)] = list(sig)
 
     def forget(self, path):
         with self._lock:
-            self.data.pop(path, None)
+            self.data.pop(self._key(path), None)
 
     def save(self):
         with self._lock:
@@ -161,8 +161,8 @@ def run_batch(folders, force=False, dry_run=False, since=0.0, workers=None,
                 r = Result(futs[fut], "failed", message=str(e))
             stats[r.status] += 1
             if cache is not None:
-                if r.status in ("ok", "repaired", "reencoded"):
-                    cache.mark_clean(r.path)
+                if r.sig:
+                    cache.mark_clean(r.path, r.sig)
                 else:
                     cache.forget(r.path)
             done += 1
@@ -194,6 +194,7 @@ class Watcher:
         self._stop = threading.Event()
         self._pool = ThreadPoolExecutor(max_workers=max(2, min(8, pick_workers())))
         self._last_scan = time.time()
+        self._last_clean = time.time()
 
     def start(self):
         from watchdog.events import FileSystemEventHandler
@@ -236,6 +237,12 @@ class Watcher:
                 self._last_scan = now
                 if self.cache is not None:
                     self.cache.save()
+                if now - self._last_clean >= 3600:  # long sessions (autostart)
+                    self._last_clean = now
+                    try:
+                        clean_quarantine(days=7)
+                    except Exception:
+                        pass
                 try:
                     for p in iter_pngs(self.folders, since=since):
                         if p not in self._pending:
@@ -259,15 +266,15 @@ class Watcher:
             r = process_file(path, dry_run=True, wait_stable=3.0)
             if r.status == "ok" or not r.problems:
                 if r.status == "ok" and self.cache is not None:
-                    self.cache.mark_clean(path)
+                    self.cache.mark_clean(path, r.sig)
                 return
-            if is_incomplete(r.problems):
+            if needs_redownload(r.problems):
                 # Maybe GEOlayers is still writing: give it more time before acting
                 time.sleep(8)
             r = process_file(path, wait_stable=2.0)
             if self.cache is not None:
-                if r.status in ("ok", "repaired"):
-                    self.cache.mark_clean(path)
+                if r.sig:
+                    self.cache.mark_clean(path, r.sig)
                 else:
                     self.cache.forget(path)
             if r.status in ("repaired", "quarantined", "failed"):

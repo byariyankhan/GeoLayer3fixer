@@ -1,4 +1,5 @@
 import io
+import os
 import struct
 import zlib
 
@@ -111,15 +112,37 @@ def test_geolayers_zero_len_idat_quarantined(tmp_path):
     assert process_file(str(f)).status == "quarantined"
 
 
+def pixels(data):
+    with Image.open(io.BytesIO(data)) as im:
+        return im.mode, im.size, im.tobytes()
+
+
+def extra_data(data):
+    """Junk after the zlib stream inside IDAT (libpng: 'Extra compressed data')."""
+    p = _parse_chunks(data)
+    return (PNG_SIG + chunk(b"IHDR", p.ihdr) + chunk(b"IDAT", bytes(p.idat) + b"JUNKJUNK")
+            + chunk(b"IEND", b""))
+
+
+def split_idat(data):
+    """IDAT run interrupted by another chunk ('Too many IDATs found')."""
+    p = _parse_chunks(data)
+    z = bytes(p.idat)
+    h = len(z) // 2
+    return (PNG_SIG + chunk(b"IHDR", p.ihdr) + chunk(b"IDAT", z[:h]) + chunk(b"tEXt", b"a\x00b")
+            + chunk(b"IDAT", z[h:]) + chunk(b"IEND", b""))
+
+
 @pytest.mark.parametrize("breaker,needle", [
-    (bad_filter, "bad adaptive filter"),
     (bad_crc, "CRC"),
+    (extra_data, "extra data"),
+    (split_idat, "not consecutive"),
 ])
-def test_detect_and_repair(tmp_path, breaker, needle):
-    broken = breaker(make_png())
+def test_lossless_repair_keeps_every_pixel(tmp_path, breaker, needle):
+    good = make_png()
+    broken = breaker(good)
     probs = inspect_bytes(broken)
-    assert probs, "corruption should be detected"
-    assert needle in " ".join(probs)
+    assert needle in " ".join(probs), probs
 
     f = tmp_path / "12_345_678.png"
     f.write_bytes(broken)
@@ -128,7 +151,64 @@ def test_detect_and_repair(tmp_path, breaker, needle):
     fixed = f.read_bytes()
     assert inspect_bytes(fixed) == []
     assert pillow_strict_ok(fixed) == (64, 64)
+    assert pixels(fixed) == pixels(good)          # byte-identical image
+    assert r.sig == (f.stat().st_size, f.stat().st_mtime_ns)
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_bad_filter_is_quarantined_not_patched(tmp_path, isolated_appdata):
+    """Patching filter bytes leaves visible stripes (errors spread through
+    Up/Paeth rows) -> the tile must be re-downloaded instead."""
+    f = tmp_path / "tiles" / "b.png"
+    f.parent.mkdir()
+    f.write_bytes(bad_filter(make_png()))
+    r = process_file(str(f))
+    assert r.status == "quarantined", r
+    assert "bad adaptive filter" in " ".join(r.problems)
+    assert not f.exists()
+
+
+def test_tile_rewritten_during_repair_is_not_overwritten(tmp_path, monkeypatch):
+    """GEOlayers re-writes a tile while we repair the old copy: keep the new one."""
+    import geolayer_fixer.core as core
+    f = tmp_path / "t.png"
+    f.write_bytes(bad_crc(make_png()))
+    newer = make_png(32, 32)
+    real = core._rebuild_lossless
+
+    def slow_rebuild(p):
+        out = real(p)
+        f.write_bytes(newer)                 # GEOlayers writes a fresh tile
+        os.utime(f, ns=(1, 1))               # guarantee a different signature
+        return out
+
+    monkeypatch.setattr(core, "_rebuild_lossless", slow_rebuild)
+    r = process_file(str(f))
+    assert r.status == "skipped" and "rewritten" in r.message
+    assert f.read_bytes() == newer
+
+
+def test_quarantine_respects_concurrent_rewrite(tmp_path, monkeypatch):
+    import geolayer_fixer.core as core
+    f = tmp_path / "tiles" / "q.png"
+    f.parent.mkdir()
+    f.write_bytes(truncated(make_png()))
+    newer = make_png()
+    real = core.inspect_bytes
+    calls = {"n": 0}
+
+    def inspect_then_rewrite(data):
+        res = real(data)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            f.write_bytes(newer)
+            os.utime(f, ns=(1, 1))
+        return res
+
+    monkeypatch.setattr(core, "inspect_bytes", inspect_then_rewrite)
+    r = process_file(str(f))
+    assert r.status == "skipped"
+    assert f.read_bytes() == newer
 
 
 def test_clean_file_untouched(tmp_path):
@@ -171,3 +251,15 @@ def test_palette_png(tmp_path):
     f.write_bytes(bad_crc(buf.getvalue()))
     assert process_file(str(f)).status == "repaired"
     assert inspect_bytes(f.read_bytes()) == []
+
+
+def test_quarantine_name_never_grows(tmp_path, isolated_appdata):
+    long = "_".join(["1790894380"] * 20) + "_esri-muowx25av9p7l_1024_6_12021.png"
+    f = tmp_path / "tiles" / long
+    f.parent.mkdir()
+    f.write_bytes(truncated(make_png()))
+    r = process_file(str(f))
+    assert r.status == "quarantined", r
+    (q,) = (isolated_appdata / "quarantine").iterdir()
+    assert q.name.endswith("_esri-muowx25av9p7l_1024_6_12021.png")
+    assert len(q.name) == 14 + len("esri-muowx25av9p7l_1024_6_12021.png")

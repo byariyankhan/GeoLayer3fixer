@@ -7,9 +7,13 @@ silently tolerated. The two errors seen with GEOlayers 3 tiles are:
   * "bad adaptive filter value"  -> a scanline starts with a filter byte > 4
   * "IDAT: CRC error"            -> a chunk's CRC32 does not match its data
 
-This module checks every PNG for exactly those problems (plus truncation and
-broken zlib streams), and repairs them by rebuilding a clean, spec-compliant
-PNG. Files that are already valid are left untouched unless `force=True`.
+Policy (v2.2): a tile is only repaired when the repair is LOSSLESS - every
+pixel stays exactly as GEOlayers intended (wrong CRCs, data after the image,
+split IDAT runs). Anything that would change pixels (bad filter bytes,
+corrupt/missing image data) is moved to quarantine instead, so GEOlayers
+downloads a correct copy. Patching a bad filter byte looks harmless but the
+error spreads to following rows through the Up/Average/Paeth filters and
+shows up as visible stripes in the map.
 """
 
 from __future__ import annotations
@@ -22,8 +26,6 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageFile
-
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
 # Channels per PNG colour type
@@ -33,9 +35,28 @@ _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
 @dataclass
 class Result:
     path: str
-    status: str  # "ok" | "repaired" | "reencoded" | "failed" | "skipped"
+    status: str  # ok | repaired | reencoded | quarantined | failed | skipped
     problems: list[str] = field(default_factory=list)
     message: str = ""
+    # (size, mtime_ns) of the file content this result is about; used by the
+    # verified cache so it never marks a tile clean that it did not check.
+    sig: tuple[int, int] | None = None
+
+
+# --------------------------------------------------------------------------
+# Problem classification
+# --------------------------------------------------------------------------
+
+# Problems that can be fixed without touching a single pixel
+LOSSLESS = ("CRC error", "extra data after image", "too much image data",
+            "IDAT chunks not consecutive")
+
+
+def needs_redownload(problems: list[str]) -> bool:
+    """True if fixing the tile would alter pixels -> quarantine + re-download."""
+    return any(not pr.startswith(LOSSLESS) for pr in problems)
+
+
 
 
 # --------------------------------------------------------------------------
@@ -50,9 +71,12 @@ class _Parsed:
     bit_depth: int = 0
     color_type: int = 0
     interlace: int = 0
-    ancillary: list[tuple[bytes, bytes]] = field(default_factory=list)  # PLTE, tRNS, gAMA...
+    pre_idat: list[tuple[bytes, bytes]] = field(default_factory=list)   # PLTE, tRNS, sRGB...
     idat: bytearray = field(default_factory=bytearray)
     problems: list[str] = field(default_factory=list)
+
+
+_KEEP_CHUNKS = (b"PLTE", b"tRNS", b"gAMA", b"sRGB", b"cHRM", b"iCCP", b"pHYs", b"sBIT", b"bKGD")
 
 
 def _parse_chunks(data: bytes) -> _Parsed:
@@ -64,6 +88,8 @@ def _parse_chunks(data: bytes) -> _Parsed:
     pos = len(PNG_SIG)
     seen_iend = False
     crc_bad = 0
+    idat_runs = 0
+    prev = b""
     while pos + 8 <= len(data):
         length = struct.unpack(">I", data[pos:pos + 4])[0]
         ctype = data[pos + 4:pos + 8]
@@ -73,11 +99,9 @@ def _parse_chunks(data: bytes) -> _Parsed:
             p.problems.append(f"garbage chunk header at byte {pos}")
             break
         if body_end + 4 > len(data):
-            # Truncated chunk: keep whatever body bytes exist
             p.problems.append(f"truncated {ctype.decode('latin1')} chunk")
-            body = data[body_start:min(body_end, len(data))]
             if ctype == b"IDAT":
-                p.idat += body
+                p.idat += data[body_start:min(body_end, len(data))]
             break
         body = data[body_start:body_end]
         crc = struct.unpack(">I", data[body_end:body_end + 4])[0]
@@ -90,17 +114,22 @@ def _parse_chunks(data: bytes) -> _Parsed:
                 (p.width, p.height, p.bit_depth, p.color_type,
                  _comp, _filt, p.interlace) = struct.unpack(">IIBBBBB", body[:13])
         elif ctype == b"IDAT":
+            if prev != b"IDAT":
+                idat_runs += 1
             p.idat += body
         elif ctype == b"IEND":
             seen_iend = True
             break
-        elif ctype in (b"PLTE", b"tRNS", b"gAMA", b"sRGB", b"cHRM", b"iCCP", b"pHYs"):
-            p.ancillary.append((ctype, body))
+        elif ctype in _KEEP_CHUNKS and not p.idat:
+            p.pre_idat.append((ctype, body))
+        prev = ctype
         pos = body_end + 4
 
     if crc_bad:
         p.problems.append(f"CRC error in {crc_bad} chunk(s)")
-    if not seen_iend and "truncated" not in " ".join(p.problems):
+    if idat_runs > 1:
+        p.problems.append("IDAT chunks not consecutive")
+    if not seen_iend and not any(x.startswith(("truncated", "garbage")) for x in p.problems):
         p.problems.append("missing IEND (file cut off)")
     if p.ihdr is None:
         p.problems.append("missing IHDR")
@@ -116,24 +145,27 @@ def _row_geometry(p: _Parsed) -> tuple[int, int]:
     return bpp, stride
 
 
-def _inflate_lenient(idat: bytes) -> tuple[bytes, str | None]:
+def _inflate(idat: bytes) -> tuple[bytes, list[str]]:
+    """Decompress IDAT data. Returns (raw, problems)."""
     d = zlib.decompressobj()
     try:
-        raw = d.decompress(bytes(idat))
-        raw += d.flush()
-        if not d.eof:
-            return raw, "zlib stream incomplete"
-        return raw, None
+        raw = d.decompress(bytes(idat)) + d.flush()
     except zlib.error as e:
-        # Salvage as much as possible: decompress in small pieces
+        # Salvage what we can (only used for diagnostics)
         d = zlib.decompressobj()
         out = bytearray()
-        for i in range(0, len(idat), 256):
+        for i in range(0, len(idat), 4096):
             try:
-                out += d.decompress(bytes(idat[i:i + 256]))
+                out += d.decompress(bytes(idat[i:i + 4096]))
             except zlib.error:
                 break
-        return bytes(out), f"zlib error ({e})"
+        return bytes(out), [f"zlib error ({e})"]
+    probs = []
+    if not d.eof:
+        probs.append("zlib stream incomplete")
+    elif d.unused_data:
+        probs.append("extra data after image stream")
+    return raw, probs
 
 
 # --------------------------------------------------------------------------
@@ -156,66 +188,89 @@ def inspect_bytes(data: bytes) -> list[str]:
     if p.ihdr is None or p.width == 0 or p.height == 0:
         return problems or ["invalid header"]
 
-    raw, zerr = _inflate_lenient(p.idat)
-    if zerr:
-        problems.append(zerr)
+    raw, zprobs = _inflate(p.idat)
+    problems += zprobs
 
     if p.interlace == 0:
         _bpp, stride = _row_geometry(p)
         row_len = stride + 1
-        rows_present = len(raw) // row_len
-        bad = sum(1 for r in range(min(rows_present, p.height)) if raw[r * row_len] > 4)
+        expected = row_len * p.height
+        rows_present = min(len(raw) // row_len, p.height)
+        bad = sum(1 for r in range(rows_present) if raw[r * row_len] > 4)
         if bad:
             problems.append(f"bad adaptive filter value in {bad} row(s)")
-        if rows_present < p.height:
+        if len(raw) < expected:
             problems.append(f"missing {p.height - rows_present} of {p.height} rows")
+        elif len(raw) > expected:
+            problems.append("too much image data")
     return problems
 
 
-def _rebuild_png(p: _Parsed) -> bytes:
-    """Build a clean PNG: valid CRCs, filter bytes 0-4, all rows present."""
-    raw, _ = _inflate_lenient(p.idat)
+def _chunk(t: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + t + body + struct.pack(">I", zlib.crc32(t + body) & 0xFFFFFFFF)
+
+
+def _rebuild_lossless(p: _Parsed) -> bytes:
+    """Re-pack the original filtered scanlines into a clean PNG: fresh CRCs,
+    one IDAT run, no trailing junk. Pixel data is byte-for-byte unchanged."""
+    raw, zprobs = _inflate(p.idat)
+    if any(x.startswith(("zlib error", "zlib stream incomplete")) for x in zprobs):
+        raise ValueError("image data damaged")
     if p.interlace == 0:
         _bpp, stride = _row_geometry(p)
-        row_len = stride + 1
-        fixed = bytearray()
-        for r in range(p.height):
-            row = raw[r * row_len:(r + 1) * row_len]
-            if len(row) < row_len or row[0] > 4:
-                # Bad filter byte or missing/short row -> "None" filter, zero-pad
-                row = (b"\x00" + row[1:]).ljust(row_len, b"\x00")
-            fixed += row
-        raw = bytes(fixed)
-
-    def chunk(t: bytes, body: bytes) -> bytes:
-        return struct.pack(">I", len(body)) + t + body + struct.pack(">I", zlib.crc32(t + body) & 0xFFFFFFFF)
-
+        expected = (stride + 1) * p.height
+        if len(raw) < expected:
+            raise ValueError("image data incomplete")
+        raw = raw[:expected]
     out = bytearray(PNG_SIG)
-    out += chunk(b"IHDR", p.ihdr[:13])
-    for t, body in p.ancillary:
-        out += chunk(t, body)
-    # Split into 1 MB IDAT chunks (some decoders dislike one giant chunk);
-    # level 3 = fast enough for 4096px tiles, AE doesn't care about size.
+    out += _chunk(b"IHDR", p.ihdr[:13])
+    for t, body in p.pre_idat:
+        out += _chunk(t, body)
+    # 1 MB IDAT chunks; level 3 is fast enough for 4096px tiles
     z = zlib.compress(raw, 3)
     for i in range(0, len(z), 1 << 20):
-        out += chunk(b"IDAT", z[i:i + (1 << 20)])
-    out += chunk(b"IEND", b"")
+        out += _chunk(b"IDAT", z[i:i + (1 << 20)])
+    out += _chunk(b"IEND", b"")
     return bytes(out)
 
 
 def _reencode(data: bytes) -> bytes:
-    """Decode with Pillow and write a brand-new standard PNG."""
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    """Decode with Pillow (strict) and write a brand-new standard PNG.
+    Only used for 'Force' mode on files that are already clean."""
+    from PIL import Image
     with Image.open(io.BytesIO(data)) as im:
         im.load()
-        if im.mode not in ("RGB", "RGBA", "L", "LA", "P", "I;16"):
-            im = im.convert("RGBA")
-        buf = io.BytesIO()
         info = {}
         if "transparency" in im.info:
             info["transparency"] = im.info["transparency"]
+        buf = io.BytesIO()
         im.save(buf, format="PNG", compress_level=3, **info)
         return buf.getvalue()
+
+
+def _same_pixels(a: bytes, b: bytes) -> bool:
+    """True if both PNGs carry exactly the same image.
+    Compares the decompressed scanlines (works even when `a` has CRC errors,
+    which Pillow refuses to open); falls back to a Pillow pixel comparison
+    when the encodings differ (force/re-encode mode)."""
+    pa, pb = _parse_chunks(a), _parse_chunks(b)
+    if pa.ihdr is None or pb.ihdr is None or pa.ihdr[:13] != pb.ihdr[:13]:
+        return False
+    ra, _ = _inflate(pa.idat)
+    rb, _ = _inflate(pb.idat)
+    if pa.interlace == 0:
+        _bpp, stride = _row_geometry(pa)
+        n = (stride + 1) * pa.height
+        if ra[:n] == rb[:n] and len(rb) == n:
+            return True
+    elif ra == rb:
+        return True
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(a)) as x, Image.open(io.BytesIO(b)) as y:
+            return x.size == y.size and x.mode == y.mode and x.tobytes() == y.tobytes()
+    except Exception:
+        return False
 
 
 def _wait_stable(path: Path, timeout: float) -> bool:
@@ -234,34 +289,38 @@ def _wait_stable(path: Path, timeout: float) -> bool:
     return last > 0
 
 
-def _atomic_write(path: Path, data: bytes, retries: int = 20) -> None:
+def _sig(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return (st.st_size, st.st_mtime_ns)
+
+
+class ChangedError(Exception):
+    """The tile was rewritten (by GEOlayers) while we were working on it."""
+
+
+def _atomic_write(path: Path, data: bytes, expect_sig=None, retries: int = 20) -> None:
     tmp = path.with_name(path.name + ".glfix.tmp")
     with open(tmp, "wb") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    for i in range(retries):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            # File locked (AE or GEOlayers reading it) -> retry
-            time.sleep(0.15 * (i + 1))
     try:
-        tmp.unlink()
-    except OSError:
-        pass
-    raise PermissionError("file is locked by another program")
-
-
-_INCOMPLETE = ("truncated", "missing", "incomplete", "cut off", "zlib error", "garbage")
-
-
-def is_incomplete(problems: list[str]) -> bool:
-    """True if image data is physically missing (half-written / cut-off download).
-    Such tiles must NOT be 'repaired' - that would bake black bands into the
-    map. They are moved to quarantine so GEOlayers downloads them again."""
-    return any(k in pr for pr in problems for k in _INCOMPLETE)
+        for i in range(retries):
+            if expect_sig is not None and _sig(path) != expect_sig:
+                raise ChangedError()
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # File locked (AE or GEOlayers reading it) -> retry
+                time.sleep(0.15 * (i + 1))
+        raise PermissionError("file is locked by another program")
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def app_dir() -> Path:
@@ -307,14 +366,24 @@ def clean_quarantine(days: float = 7) -> int:
     return n
 
 
+def _quarantine_name(name: str) -> str:
+    """'<ms>_<original name>' - strips timestamp prefixes added by earlier
+    versions and caps the length (Windows paths max out at 260 chars)."""
+    import re
+    base = re.sub(r"^(\d{10,13}_)+", "", name)
+    if len(base) > 120:
+        stem, ext = os.path.splitext(base)
+        base = stem[-(120 - len(ext)):] + ext
+    return f"{int(time.time() * 1000)}_{base}"
+
+
 def quarantine(path: Path, qdir: Path) -> str:
     qdir.mkdir(parents=True, exist_ok=True)
-    dest = qdir / f"{int(time.time() * 1000)}_{path.name}"
+    dest = qdir / _quarantine_name(path.name)
     try:
         os.replace(path, dest)
     except OSError:
-        # Different drive -> copy + delete
-        import shutil
+        import shutil  # different drive -> copy + delete
         shutil.move(str(path), str(dest))
     os.utime(dest)  # age counts from quarantine time
     return str(dest)
@@ -322,7 +391,7 @@ def quarantine(path: Path, qdir: Path) -> str:
 
 def process_file(path: str, force: bool = False, dry_run: bool = False,
                  wait_stable: float = 0.0, quarantine_to: str | None = None) -> Result:
-    """Inspect one PNG and repair it if needed. Safe to run in a worker process.
+    """Inspect one PNG and fix it if needed. Safe to run in a worker process.
 
     status: ok | repaired | reencoded | quarantined | failed | skipped
     """
@@ -330,7 +399,10 @@ def process_file(path: str, force: bool = False, dry_run: bool = False,
     try:
         if wait_stable and not _wait_stable(p, wait_stable):
             return Result(path, "skipped", message="file vanished or empty")
+        sig0 = _sig(p)
         data = p.read_bytes()
+        if _sig(p) != sig0 or len(data) != sig0[0]:
+            return Result(path, "skipped", message="file is still being written")
     except OSError as e:
         return Result(path, "skipped", message=str(e))
 
@@ -339,49 +411,53 @@ def process_file(path: str, force: bool = False, dry_run: bool = False,
 
     problems = inspect_bytes(data)
     if not problems and not force:
-        return Result(path, "ok")
+        return Result(path, "ok", sig=sig0)
     if dry_run:
-        return Result(path, "failed" if problems else "ok", problems, "(scan only)")
+        return Result(path, "failed" if problems else "ok", problems, "(scan only)",
+                      sig=None if problems else sig0)
 
-    if is_incomplete(problems):
-        qdir = Path(quarantine_to) if quarantine_to else quarantine_dir()
+    changed = Result(path, "skipped", problems, "tile was rewritten while fixing; will re-check")
+
+    if needs_redownload(problems):
         try:
-            dest = quarantine(p, qdir)
+            if _sig(p) != sig0:
+                return changed
+            dest = quarantine(p, Path(quarantine_to) if quarantine_to else quarantine_dir())
         except OSError as e:
-            return Result(path, "failed", problems, f"incomplete tile, could not move: {e}")
+            return Result(path, "failed", problems, f"could not move to quarantine: {e}")
         return Result(path, "quarantined", problems,
-                      f"incomplete tile moved to {dest} - GEOlayers will re-download it")
+                      f"moved to {dest} - GEOlayers will download it again")
 
-    # Data is all there; only CRCs / filter bytes / chunk layout are wrong.
-    candidates = []
     try:
-        candidates.append(_rebuild_png(_parse_chunks(data)))  # fast, keeps pixels
-    except Exception:
-        pass
+        if problems:
+            out = _rebuild_lossless(_parse_chunks(data))
+        else:  # force mode on a clean tile
+            out = _reencode(data)
+        if inspect_bytes(out) or not _same_pixels(data, out):
+            raise ValueError("rebuilt tile did not verify")
+    except Exception as e:
+        return Result(path, "failed", problems, f"could not rebuild ({e})")
+
     try:
-        candidates.append(_reencode(data))  # fallback (e.g. interlaced PNG)
-    except Exception:
-        pass
-
-    for out in candidates:
-        if out and not inspect_bytes(out):
-            try:
-                _atomic_write(p, out)
-            except Exception as e:
-                return Result(path, "failed", problems, f"write failed: {e}")
-            return Result(path, "repaired" if problems else "reencoded", problems)
-
-    return Result(path, "failed", problems, "could not rebuild - delete this tile so GEOlayers re-downloads it")
+        _atomic_write(p, out, expect_sig=sig0)
+        new_sig = _sig(p)
+    except ChangedError:
+        return changed
+    except Exception as e:
+        return Result(path, "failed", problems, f"write failed: {e}")
+    return Result(path, "repaired" if problems else "reencoded", problems, sig=new_sig)
 
 
 _NOT_PNG_EXT = (".json", ".txt", ".log", ".jpg", ".jpeg", ".webp", ".pbf", ".mvt",
                 ".tif", ".tiff", ".zip", ".jsx", ".aep", ".aet", ".lic", ".shp", ".dbf")
 
 
-def iter_pngs(folders: list[str], since: float = 0.0):
+def iter_pngs(folders: list[str], since: float = 0.0, clean_tmp: bool = True):
     """Yield every PNG under the given folders (by signature, any extension).
-    Quarantine folders and the app's own folder are skipped."""
+    Quarantine folders and the app's own folder are skipped. Leftover temp
+    files from an interrupted repair (older than 1 hour) are deleted."""
     seen = set()
+    stale = time.time() - 3600
     for folder in folders:
         root = Path(os.path.expandvars(folder))
         if not root.is_dir() or is_excluded(root):
@@ -390,10 +466,19 @@ def iter_pngs(folders: list[str], since: float = 0.0):
             dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIR_NAMES]
             for name in files:
                 low = name.lower()
-                if low.endswith(".glfix.tmp") or low.endswith(_NOT_PNG_EXT):
-                    continue
                 fp = os.path.join(dirpath, name)
-                if fp in seen:
+                if low.endswith(".glfix.tmp"):
+                    if clean_tmp:
+                        try:
+                            if os.path.getmtime(fp) < stale:
+                                os.unlink(fp)
+                        except OSError:
+                            pass
+                    continue
+                if low.endswith(_NOT_PNG_EXT):
+                    continue
+                key = os.path.normcase(fp)
+                if key in seen:
                     continue
                 if since:
                     try:
@@ -402,7 +487,7 @@ def iter_pngs(folders: list[str], since: float = 0.0):
                     except OSError:
                         continue
                 if low.endswith(".png") or is_png_file(fp):
-                    seen.add(fp)
+                    seen.add(key)
                     yield fp
 
 
