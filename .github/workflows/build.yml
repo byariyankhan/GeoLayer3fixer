@@ -47,8 +47,20 @@ jobs:
           name: GeoLayer_Fixer
           path: dist/GeoLayer_Fixer.exe
 
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "v=$(python -c 'import geolayer_fixer; print(geolayer_fixer.__version__)')" >> "$GITHUB_OUTPUT"
+
+      # Every push to main publishes/updates the release for the current version
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.v }}
+          target_commitish: ${{ github.sha }}
+          name: GeoLayer Fixer v${{ steps.ver.outputs.v }}
+          body: |
+            Download **GeoLayer_Fixer.exe** below.
+            Close the old v1 fixer first. Then: keep Auto Watcher on, click Fix Tiles Now before render,
+            and in AE use Edit > Purge > All Memory & Disk Cache.
           files: dist/GeoLayer_Fixer.exe
