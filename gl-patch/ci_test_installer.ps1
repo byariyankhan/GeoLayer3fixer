@@ -1,6 +1,7 @@
 # CI test for Install-GlPatchV4.ps1 / Uninstall-GlPatchV4.ps1 on a fake GEOlayers extension
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+try {
 $ext = Join-Path $env:RUNNER_TEMP "fakeext\Geolayers 3 test"
 New-Item -ItemType Directory -Force -Path "$ext\js", "$ext\CSXS" | Out-Null
 $enc = New-Object System.Text.UTF8Encoding($false)
@@ -45,3 +46,7 @@ $code = Run "Install-GlPatchV4.ps1"
 Check ($code -eq 1) "unknown libs.js state -> exit 1"
 Check ((Get-FileHash "$ext\js\libs.js").Hash -eq $before) "unknown state left untouched"
 Write-Host "gl-patch installer tests passed"
+} catch {
+  Write-Host ("::error::EXCEPTION at line " + $_.InvocationInfo.ScriptLineNumber + ": " + $_.Exception.Message + " | " + $_.InvocationInfo.Line.Trim())
+  exit 1
+}
