@@ -1,6 +1,7 @@
 # CI test for Install-GlPatchV4.ps1 / Uninstall-GlPatchV4.ps1 on a fake GEOlayers extension
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:passed = 0
 try {
 $ext = Join-Path $env:RUNNER_TEMP "fakeext\Geolayers 3 test"
 New-Item -ItemType Directory -Force -Path "$ext\js", "$ext\CSXS" | Out-Null
@@ -13,12 +14,12 @@ $main = "a();x=glSafeImageFile.writeDataUriAtomic(r,n+`".`"+i).then(f);b('ä');`
 $h0 = (Get-FileHash "$ext\js\libs.js").Hash, (Get-FileHash "$ext\js\main.js").Hash
 
 function Ann($text) { ($text -replace "%", "%25" -replace "`r", "" -replace "`n", "%0A") }
-function Check($cond, $msg) { if (-not $cond) { Write-Host "::error::FAIL: $msg"; exit 1 } else { Write-Host "::notice::ok - $msg" } }
+function Check($cond, $msg) { if (-not $cond) { Write-Host "::error::FAIL: $msg"; exit 1 } else { Write-Host "ok - $msg"; $script:passed++ } }
 function Run($script, [string[]]$extra) {
   $ErrorActionPreference = "Continue"
   $out = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here $script) -ExtensionDir $ext -Yes @extra 2>&1 | Out-String
   $code = $LASTEXITCODE
-  Write-Host "::notice::$script exit $code%0A$(Ann $out)"
+  Write-Host "--- $script exit $code`n$out"
   return $code
 }
 
@@ -45,8 +46,10 @@ $before = (Get-FileHash "$ext\js\libs.js").Hash
 $code = Run "Install-GlPatchV4.ps1"
 Check ($code -eq 1) "unknown libs.js state -> exit 1"
 Check ((Get-FileHash "$ext\js\libs.js").Hash -eq $before) "unknown state left untouched"
-Write-Host "gl-patch installer tests passed"
+Write-Host "::notice::gl-patch installer tests passed ($script:passed checks)"
 } catch {
   Write-Host ("::error::EXCEPTION at line " + $_.InvocationInfo.ScriptLineNumber + ": " + $_.Exception.Message + " | " + $_.InvocationInfo.Line.Trim())
   exit 1
 }
+# the last installer call is EXPECTED to exit 1; don't let its $LASTEXITCODE fail the step
+exit 0
