@@ -34,11 +34,11 @@ rows became 217 visibly wrong rows after patching — stripes in the map.
 * Only one copy can run at a time; an old *Start with Windows* entry pointing at v1 is switched to this version.
 * Shows a notice when a newer release is available.
 
-## GL-PATCH v4 (recommended)
+## GL-PATCH v4.1 (recommended)
 
 The Fixer can only react after a broken tile is on disk - often After Effects reads it first.
-`GL-PATCH-v4.zip` patches GEOlayers so broken tiles are re-encoded before they are written.
-See [gl-patch/README.md](gl-patch/README.md). The Fixer's log shows whether v4 is active.
+`GL-PATCH-v4.zip` (GL-PATCH v4.1) patches GEOlayers so broken tiles are re-encoded before they are written.
+See [gl-patch/README.md](gl-patch/README.md). The Fixer's log shows whether v4.1 is active.
 
 ## Use
 

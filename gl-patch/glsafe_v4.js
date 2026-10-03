@@ -1,4 +1,7 @@
-/* GL-PATCH v4 2026-10-03: safe tile image writes + FULL PNG validation + re-encode on corruption.
+/* GL-PATCH v4.1 2026-10-03: safe tile image writes + FULL PNG validation + canvas.toDataURL guard.
+   v4.1: every PNG returned by canvas.toDataURL() in this panel is validated; a broken one is replaced by a
+   PNG encoded from the same canvas pixels with Node zlib. Covers ALL GEOlayers tile paths (tile merger,
+   GL renderer, zoom-level merge) - v4.0 only covered the zoom-level merge.
    v4: v3 only checked chunk CRCs. Chromium's canvas.toDataURL() in AE 25/26 sometimes returns PNGs whose
    CRCs are fine but whose compressed image data is broken (-> "bad adaptive filter value"). v4 inflates every
    PNG and checks every scanline before it is written; a broken encode is retried, and if it fails again the
@@ -68,28 +71,63 @@ window.glSafeImageFile=(function(){
     out=Buffer.concat([hdr,data,Buffer.alloc(4)]);
     out.writeUInt32BE(crc32(out,4,8+data.length),8+data.length);return out;
   }
-  /* Our own PNG encoder (RGBA 8-bit, "Sub" filter, Node zlib) - used when Chromium's encoder keeps failing.
-     Runs zlib on Node's thread pool so the panel does not freeze on 4096px tiles. */
+  /* Our own PNG encoder (RGBA 8-bit, "Sub" filter, Node zlib) - used when Chromium's encoder fails. */
+  function encodeRgbaPng(w,h,px){
+    var stride=4*w,rl=stride+1,raw=Buffer.allocUnsafe(rl*h);
+    for(var y=0;y<h;y++){
+      var o=y*rl,s=y*stride,x;raw[o]=1;
+      for(x=0;x<4;x++)raw[o+1+x]=px[s+x];
+      for(x=4;x<stride;x++)raw[o+1+x]=px[s+x]-px[s+x-4]&255;
+    }
+    var z=zl().deflateSync(raw,{level:3});
+    var ihdr=Buffer.alloc(13),parts=[Buffer.from([137,80,78,71,13,10,26,10])];
+    ihdr.writeUInt32BE(w,0);ihdr.writeUInt32BE(h,4);ihdr[8]=8;ihdr[9]=6;ihdr[10]=0;ihdr[11]=0;ihdr[12]=0;
+    parts.push(chunk("IHDR",ihdr),chunk("sRGB",Buffer.from([0])));
+    for(var i=0;i<z.length;i+=1048576)parts.push(chunk("IDAT",z.subarray(i,Math.min(z.length,i+1048576))));
+    parts.push(chunk("IEND",Buffer.alloc(0)));
+    return Buffer.concat(parts);
+  }
+  /* RGBA pixels of a 2D or WebGL canvas */
+  function pixelsOf(canvas){
+    var w=canvas.width,h=canvas.height,ctx=null;
+    try{ctx=canvas.getContext("2d")}catch(e){}
+    if(!ctx){
+      var c2=document.createElement("canvas");c2.width=w;c2.height=h;
+      ctx=c2.getContext("2d");ctx.drawImage(canvas,0,0);
+    }
+    return ctx.getImageData(0,0,w,h).data;
+  }
   function encodeCanvasPng(canvas){
-    return new Promise(function(resolve,reject){
-      var w=canvas.width,h=canvas.height,px;
-      try{px=canvas.getContext("2d").getImageData(0,0,w,h).data}catch(e){return reject(e)}
-      var stride=4*w,rl=stride+1,raw=Buffer.allocUnsafe(rl*h);
-      for(var y=0;y<h;y++){
-        var o=y*rl,s=y*stride,x;raw[o]=1;
-        for(x=0;x<4;x++)raw[o+1+x]=px[s+x];
-        for(x=4;x<stride;x++)raw[o+1+x]=px[s+x]-px[s+x-4]&255;
-      }
-      zl().deflate(raw,{level:6},function(e,z){
-        if(e)return reject(e);
-        var ihdr=Buffer.alloc(13),parts=[Buffer.from([137,80,78,71,13,10,26,10])];
-        ihdr.writeUInt32BE(w,0);ihdr.writeUInt32BE(h,4);ihdr[8]=8;ihdr[9]=6;ihdr[10]=0;ihdr[11]=0;ihdr[12]=0;
-        parts.push(chunk("IHDR",ihdr),chunk("sRGB",Buffer.from([0])));
-        for(var i=0;i<z.length;i+=1048576)parts.push(chunk("IDAT",z.subarray(i,Math.min(z.length,i+1048576))));
-        parts.push(chunk("IEND",Buffer.alloc(0)));
-        resolve(Buffer.concat(parts));
-      });
-    });
+    try{return Promise.resolve(encodeRgbaPng(canvas.width,canvas.height,pixelsOf(canvas)))}catch(e){return Promise.reject(e)}
+  }
+  /* v4.1: guard canvas.toDataURL for PNG. Valid result -> returned unchanged. Broken result -> PNG encoded
+     from the canvas pixels by us. If even that fails, the original (broken) result is returned and the
+     safe writer refuses it as before. */
+  var _origToDataURL=null;
+  function guardedToDataURL(type,quality){
+    var uri=_origToDataURL.apply(this,arguments);
+    if(type&&"image/png"!==String(type).toLowerCase())return uri;
+    if("string"!=typeof uri||uri.length<64||0!==uri.indexOf("data:image/png"))return uri;
+    var buf,err;
+    try{buf=Buffer.from(uri.slice(uri.indexOf(",")+1),"base64");err=checkBuffer(buf)}catch(e){return uri}
+    if(!err)return uri;
+    _stats.toDataUrlBad++;
+    var t0=Date.now();
+    try{
+      var own=encodeRgbaPng(this.width,this.height,pixelsOf(this)),e2=checkBuffer(own);
+      if(e2){log("own encoder ALSO produced a broken PNG ("+e2+") - check RAM/CPU stability ("+this.width+"x"+this.height+")");return uri}
+      _stats.ownEncoder++;
+      log("canvas.toDataURL returned a broken PNG ("+this.width+"x"+this.height+": "+err+") -> replaced by own encoder ("+own.length+" bytes, "+(Date.now()-t0)+" ms)");
+      return"data:image/png;base64,"+own.toString("base64");
+    }catch(e){log("own encoder failed ("+(e&&e.message)+"), keeping original "+this.width+"x"+this.height);return uri}
+  }
+  function installCanvasGuard(){
+    try{
+      if("undefined"==typeof HTMLCanvasElement||_origToDataURL)return!1;
+      _origToDataURL=HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL=guardedToDataURL;
+      return!0;
+    }catch(e){log("canvas guard NOT installed: "+(e&&e.message));return!1}
   }
   /* cheap on-disk check: "valid" | "invalid" | "unknown" (unreadable right now, or a format we do not understand) | "missing" */
   function fileState(p){
@@ -215,6 +253,7 @@ window.glSafeImageFile=(function(){
     _inflight[key]=p;p.then(clear,clear);return p;
   }
   function note(m){log(m)}
-  try{log("loaded v4 (pid "+process.pid+")")}catch(e){}
-  return{version:4,stats:_stats,checkBuffer:checkBuffer,encodeCanvasPng:encodeCanvasPng,fileState:fileState,deepFileState:deepFileState,fileLooksValid:fileLooksValid,cachedFileIsValid:cachedFileIsValid,writeBufferAtomic:writeBufferAtomic,writeDataUriAtomic:writeDataUriAtomic,writeCanvasAtomic:writeCanvasAtomic,once:once,note:note,logPath:logPath};
+  var _guard=installCanvasGuard();
+  try{log("loaded v4.1 (pid "+process.pid+", canvas guard "+(_guard?"on":"OFF")+")")}catch(e){}
+  return{version:4.1,stats:_stats,checkBuffer:checkBuffer,encodeCanvasPng:encodeCanvasPng,fileState:fileState,deepFileState:deepFileState,fileLooksValid:fileLooksValid,cachedFileIsValid:cachedFileIsValid,writeBufferAtomic:writeBufferAtomic,writeDataUriAtomic:writeDataUriAtomic,writeCanvasAtomic:writeCanvasAtomic,once:once,note:note,logPath:logPath};
 })();

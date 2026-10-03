@@ -81,8 +81,9 @@ jobs:
           name: GeoLayer Fixer v${{ steps.ver.outputs.v }}
           body: |
             **GeoLayer_Fixer.exe** - watches the GEOlayers tile cache and repairs/quarantines broken tiles.
-            **GL-PATCH-v4.zip** - patch for GEOlayers 3 itself: stops broken tiles before they are written
-            (needs GL-PATCH v3; close After Effects, unzip, double-click install.cmd).
+            **GL-PATCH-v4.zip** - GL-PATCH v4.1 for GEOlayers 3: broken PNGs from canvas.toDataURL are
+            re-encoded before they are written (needs GL-PATCH v3 or v4.0; close After Effects, unzip,
+            double-click install.cmd).
             See gl-patch/README.md.
           files: |
             dist/GeoLayer_Fixer.exe

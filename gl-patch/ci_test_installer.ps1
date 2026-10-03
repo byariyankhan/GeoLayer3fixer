@@ -27,7 +27,7 @@ $code = Run "Install-GlPatchV4.ps1"
 Check ($code -eq 0) "install exit code 0"
 $libs = [IO.File]::ReadAllText("$ext\js\libs.js", $enc)
 $mainNew = [IO.File]::ReadAllText("$ext\js\main.js", $enc)
-Check ($libs.StartsWith("/* GL-PATCH v4")) "libs.js has v4 block"
+Check ($libs.StartsWith("/* GL-PATCH v4.1")) "libs.js has v4.1 block"
 Check ($libs.EndsWith("`n`n!function o(n){var s='Kölner Straße – ünïcödé ✓'}();`n")) "rest of libs.js preserved byte-for-byte (unicode)"
 Check ($mainNew -eq "a();x=glSafeImageFile.writeCanvasAtomic(p,u,m,r,n+`".`"+i).then(f);b('ä');`n") "main.js call site replaced, rest untouched"
 Check (Test-Path "$ext\gl-patch-installed.txt") "install note written"
@@ -39,6 +39,21 @@ Check ((Get-ChildItem $ext -Directory -Filter "gl-patch-backup-v3-*").Count -eq 
 
 $code = Run "Uninstall-GlPatchV4.ps1"
 Check ((Get-FileHash "$ext\js\libs.js").Hash -eq $h0[0] -and (Get-FileHash "$ext\js\main.js").Hash -eq $h0[1]) "uninstall restores v3 byte-for-byte"
+
+# v4.0 (what the user has now) -> v4.1
+$v40 = "/* GL-PATCH v4 2026-10-03: old */`nwindow.glSafeImageFile=(function(){return{version:4}})();`n`n!function o(n){var s='Kölner Straße – ünïcödé ✓'}();`n"
+$main40 = "a();x=glSafeImageFile.writeCanvasAtomic(p,u,m,r,n+`".`"+i).then(f);b('ä');`n"
+[IO.File]::WriteAllText("$ext\js\libs.js", $v40, $enc)
+[IO.File]::WriteAllText("$ext\js\main.js", $main40, $enc)
+$code = Run "Install-GlPatchV4.ps1"
+Check ($code -eq 0) "v4.0 -> v4.1 upgrade exit 0"
+$libs = [IO.File]::ReadAllText("$ext\js\libs.js", $enc)
+Check ($libs.StartsWith("/* GL-PATCH v4.1") -and $libs.Contains("installCanvasGuard")) "v4.0 upgraded to v4.1 block"
+Check ($libs.EndsWith("`n`n!function o(n){var s='Kölner Straße – ünïcödé ✓'}();`n")) "v4.0 upgrade keeps rest of libs.js"
+Check ([IO.File]::ReadAllText("$ext\js\main.js", $enc) -eq $main40) "v4.0 upgrade leaves already-patched main.js alone"
+Check ((Get-ChildItem $ext -Directory -Filter "gl-patch-backup-v4-*").Count -eq 1) "v4.0 backup created"
+$code = Run "Uninstall-GlPatchV4.ps1"
+Check ([IO.File]::ReadAllText("$ext\js\libs.js", $enc) -eq $v40) "uninstall after upgrade restores v4.0"
 
 # unknown state (e.g. GEOlayers updated, no patch) -> refuses and changes nothing
 [IO.File]::WriteAllText("$ext\js\libs.js", "!function o(n){}();`n", $enc)

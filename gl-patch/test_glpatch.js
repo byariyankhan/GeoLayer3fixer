@@ -6,12 +6,28 @@ process.env.APPDATA = path.join(outDir, "appdata");
 fs.mkdirSync(path.join(process.env.APPDATA, "aescripts", "GEOlayers3"), { recursive: true });
 fs.mkdirSync(outDir, { recursive: true });
 
-const src = fs.readFileSync(libsPath, "utf8");
-const block = src.slice(0, src.indexOf("})();\n\n!function o(") + 5);
+// --- browser mocks: canvases are HTMLCanvasElement instances, like in CEP ---
+global.HTMLCanvasElement = function () {};
+HTMLCanvasElement.prototype.toDataURL = function () { return this._uris[Math.min(this._n++, this._uris.length - 1)]; };
+HTMLCanvasElement.prototype.getContext = function (t) {
+  if (this._kind === "webgl") return t === "2d" ? null : {};
+  const self = this;
+  return { getImageData: () => ({ data: self._px }), drawImage: (src) => { self._px = src._px; } };
+};
+function makeCanvas(w, h, uris, kind) {
+  const c = Object.create(HTMLCanvasElement.prototype);
+  Object.assign(c, { width: w, height: h, _uris: uris, _n: 0, _kind: kind || "2d" });
+  c._px = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < c._px.length; i += 4) { c._px[i] = (i >> 2) % 251; c._px[i + 1] = (i >> 9) % 253; c._px[i + 2] = 77; c._px[i + 3] = 255; }
+  return c;
+}
+global.document = { createElement: () => makeCanvas(0, 0, [], "2d") };
 global.window = {};
+const src = fs.readFileSync(libsPath, "utf8");
+const block = src.indexOf("})();\n\n!function o(") > 0 ? src.slice(0, src.indexOf("})();\n\n!function o(") + 5) : src;
 eval(block);
 const G = window.glSafeImageFile;
-assert.strictEqual(G.version, 4);
+assert.strictEqual(G.version, 4.1);
 
 // ---- helpers --------------------------------------------------------------
 function crc32(b) { let c = -1; for (const x of b) { c ^= x; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; } return (c ^ -1) >>> 0; }
@@ -57,48 +73,55 @@ ok("REAL broken tile from AE error (valid CRCs, bad data) rejected: " + G.checkB
 }
 ok("truncated file rejected", G.checkBuffer(good.subarray(0, good.length >> 1)) !== null);
 
-// ---- 3. writeCanvasAtomic: retry, then own encoder --------------------------
-function mockCanvas(w, h, uris) {
-  const px = new Uint8ClampedArray(w * h * 4);
-  for (let i = 0; i < px.length; i += 4) { px[i] = (i >> 2) % 251; px[i + 1] = (i >> 9) % 253; px[i + 2] = 77; px[i + 3] = 255; }
-  let n = 0;
-  return { width: w, height: h, px, calls: () => n,
-    getContext: () => ({ getImageData: () => ({ data: px }) }),
-    toDataURL: () => uris[Math.min(n++, uris.length - 1)] };
-}
+// ---- 3. canvas.toDataURL guard (covers every GEOlayers tile path) -----------
 const brokenUri = toUri(realBroken), goodUri = toUri(good);
+const decode = (u) => Buffer.from(u.slice(u.indexOf(",") + 1), "base64");
 
 (async () => {
-  // a) first encode broken, second good -> retry wins
-  let cv = mockCanvas(64, 64, [goodUri]);
-  let target = path.join(outDir, "retry.png");
-  await G.writeCanvasAtomic(cv, "image/png", undefined, brokenUri, target);
-  ok("broken first encode -> re-encoded, good file written", fs.readFileSync(target).equals(good) && cv.calls() === 1);
+  // a) clean PNG passes through untouched
+  let cv = makeCanvas(64, 64, [goodUri]);
+  ok("guard: clean PNG returned unchanged", cv.toDataURL("image/png") === goodUri);
+  ok("guard: default type (png) handled", makeCanvas(64, 64, [goodUri]).toDataURL() === goodUri);
 
-  // b) both broken -> own encoder from pixels
-  cv = mockCanvas(1024, 1024, [brokenUri]);
-  target = path.join(outDir, "own.png");
+  // b) broken PNG from a 2D canvas (tile merger d()) -> replaced by own encoder, pixel-exact
+  cv = makeCanvas(1024, 1024, [brokenUri]);
   let t0 = Date.now();
-  await G.writeCanvasAtomic(cv, "image/png", undefined, brokenUri, target);
-  const own = fs.readFileSync(target);
-  ok(`both encodes broken -> own encoder used (${Date.now() - t0} ms for 1024px), output valid`, G.checkBuffer(own) === null);
-  fs.writeFileSync(path.join(outDir, "own_expected.rgba"), Buffer.from(cv.px.buffer));
+  let out = cv.toDataURL("image/png");
+  let png = decode(out);
+  ok(`guard: broken PNG replaced (1024px, ${Date.now() - t0} ms), result valid`, out !== brokenUri && G.checkBuffer(png) === null);
+  fs.writeFileSync(path.join(outDir, "own.png"), png);
+  fs.writeFileSync(path.join(outDir, "own_expected.rgba"), Buffer.from(cv._px.buffer));
 
-  // c) 4096px own-encoder timing
-  cv = mockCanvas(4096, 4096, [brokenUri]);
-  target = path.join(outDir, "own4096.png");
+  // c) broken PNG from a WebGL canvas (GL renderer m()) -> pixels read through a 2D copy
+  cv = makeCanvas(512, 512, [brokenUri], "webgl");
+  out = cv.toDataURL("image/png");
+  ok("guard: WebGL canvas handled via 2D copy", out !== brokenUri && G.checkBuffer(decode(out)) === null);
+  fs.writeFileSync(path.join(outDir, "own_webgl.png"), decode(out));
+  fs.writeFileSync(path.join(outDir, "own_webgl_expected.rgba"), Buffer.from(cv._px.buffer));
+
+  // d) 4096px timing (worst case, blocks the panel this long only when Chromium failed)
+  cv = makeCanvas(4096, 4096, [brokenUri]);
   t0 = Date.now();
-  await G.writeCanvasAtomic(cv, "image/png", undefined, brokenUri, target);
-  ok(`4096px own encoder end-to-end ${Date.now() - t0} ms, valid`, G.checkBuffer(fs.readFileSync(target)) === null);
+  out = cv.toDataURL("image/png");
+  ok(`guard: 4096px replacement ${Date.now() - t0} ms, valid`, G.checkBuffer(decode(out)) === null);
 
-  // d) clean first encode -> written untouched, no retry
-  cv = mockCanvas(64, 64, [brokenUri]);
-  target = path.join(outDir, "first_ok.png");
-  await G.writeCanvasAtomic(cv, "image/png", undefined, goodUri, target);
-  ok("clean first encode written as-is (no extra encode)", fs.readFileSync(target).equals(good) && cv.calls() === 0);
+  // e) JPEG untouched
+  cv = makeCanvas(64, 64, ["data:image/jpeg;base64,/9j/AAAA"]);
+  ok("guard: JPEG untouched", cv.toDataURL("image/jpeg", 0.9) === "data:image/jpeg;base64,/9j/AAAA");
 
-  // e) 1 + 2 + 2 broken encodes in a), b), c)
-  ok("stats counted", G.stats.toDataUrlBad === 5 && G.stats.retryOk === 1 && G.stats.ownEncoder === 2, JSON.stringify(G.stats));
+  // f) end-to-end through GEOlayers' tile-merger route: d() -> S() = writeDataUriAtomic
+  cv = makeCanvas(256, 256, [brokenUri]);
+  const target = path.join(outDir, "merger_tile.png");
+  await G.writeDataUriAtomic(cv.toDataURL("image/png"), target);
+  ok("tile-merger route: broken encode still ends as a valid file on disk", G.checkBuffer(fs.readFileSync(target)) === null);
+
+  // g) zoom-level merge route (main.js -> writeCanvasAtomic)
+  cv = makeCanvas(128, 128, [brokenUri]);
+  const t2 = path.join(outDir, "merge_tile.png");
+  await G.writeCanvasAtomic(cv, "image/png", undefined, cv.toDataURL("image/png"), t2);
+  ok("zoom-merge route: valid file on disk", G.checkBuffer(fs.readFileSync(t2)) === null);
+
+  ok("stats counted", G.stats.toDataUrlBad === 5 && G.stats.ownEncoder === 5, JSON.stringify(G.stats));
 
   // f) cache check deletes a broken cached tile so GEOlayers re-renders it
   const cached = path.join(outDir, "cached_broken.png");
@@ -109,6 +132,6 @@ const brokenUri = toUri(realBroken), goodUri = toUri(good);
   ok("good cached tile is reused", G.cachedFileIsValid(cachedGood) === true);
 
   const log = fs.readFileSync(G.logPath(), "utf8");
-  ok("log explains what happened", /BROKEN PNG from canvas.toDataURL/.test(log) && /own encoder used/.test(log) && /loaded v4/.test(log));
+  ok("log explains what happened", /returned a broken PNG/.test(log) && /replaced by own encoder/.test(log) && /loaded v4.1 .*canvas guard on/.test(log));
   console.log(`\n${pass} checks passed`);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });

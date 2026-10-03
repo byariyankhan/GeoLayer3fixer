@@ -161,11 +161,11 @@ class App(ctk.CTk):
         if old:
             self._log(f"Start-with-Windows was launching an old fixer ({old}). Switched it to this version.")
         for ext, state in glpatch_status():
-            if state == "v4":
-                self._log(f"GL-PATCH v4 active in GEOlayers - broken tiles are stopped before they reach disk.")
+            if state == "v4.1":
+                self._log("GL-PATCH v4.1 active in GEOlayers - broken tiles are re-encoded before they reach disk.")
             else:
-                self._log(f"GEOlayers has GL-PATCH {state}: install GL-PATCH v4 (Releases page) so broken tiles "
-                          f"never reach After Effects. ({ext})")
+                self._log(f"GEOlayers has GL-PATCH {state}: install GL-PATCH v4.1 (Releases page) so broken tiles "
+                          f"are re-encoded instead of failing. ({ext})")
         removed = clean_quarantine(days=7)
         if removed:
             self._log(f"Deleted {removed} quarantined tile(s) older than 7 days.")

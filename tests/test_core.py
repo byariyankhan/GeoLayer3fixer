@@ -288,7 +288,8 @@ def test_quarantine_retries_while_file_locked(tmp_path, isolated_appdata, monkey
 def test_glpatch_status(tmp_path, monkeypatch):
     from geolayer_fixer.core import glpatch_status
     ext = tmp_path / "pf" / "Common Files" / "Adobe" / "CEP" / "extensions"
-    for name, head in (("GEO v4", "/* GL-PATCH v4 x */"), ("GEO v3", "/* GL-PATCH v3 x */"), ("GEO plain", "!function(){}")):
+    for name, head in (("GEO v41", "/* GL-PATCH v4.1 x */"), ("GEO v4", "/* GL-PATCH v4 x */"),
+                       ("GEO v3", "/* GL-PATCH v3 x */"), ("GEO plain", "!function(){}")):
         (ext / name / "js").mkdir(parents=True)
         (ext / name / "CSXS").mkdir()
         (ext / name / "CSXS" / "manifest.xml").write_text("<X Name='GEOlayers 3'/>")
@@ -297,4 +298,4 @@ def test_glpatch_status(tmp_path, monkeypatch):
     (ext / "Other" / "CSXS" / "manifest.xml").write_text("<X Name='Lottie'/>")
     monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "pf"))
     st = {os.path.basename(d): s for d, s in glpatch_status()}
-    assert st == {"GEO v4": "v4", "GEO v3": "v3", "GEO plain": "none"}
+    assert st == {"GEO v41": "v4.1", "GEO v4": "v4.0", "GEO v3": "v3", "GEO plain": "none"}

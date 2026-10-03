@@ -1,13 +1,13 @@
 <#
-  GL-PATCH v4 installer for GEOlayers 3 (After Effects CEP extension)
+  GL-PATCH v4.1 installer for GEOlayers 3 (After Effects CEP extension)
 
-  Upgrades an installed GL-PATCH v3 to v4:
-    * js\libs.js : the glSafeImageFile block is replaced with v4 (full PNG validation,
-                   re-encode on corruption, own Node-zlib encoder as fallback)
+  Upgrades an installed GL-PATCH v3 or v4.0 to v4.1:
+    * js\libs.js : the glSafeImageFile block is replaced (full PNG validation + guard on
+                   canvas.toDataURL: broken PNGs are re-encoded from the canvas pixels)
     * js\main.js : merged tiles are written through writeCanvasAtomic (one call site)
 
   Safe by design:
-    * only patches files in the exact v3 state (anything else -> stops, changes nothing)
+    * only patches files in a known GL-PATCH v3/v4 state (anything else -> stops, changes nothing)
     * After Effects must be closed
     * current files are backed up next to the extension; Uninstall-GlPatchV4.ps1 restores them
     * result is verified after writing
@@ -31,11 +31,11 @@ function Sha($path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash }
 function ReadText($path) { [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($path)) }
 function WriteText($path, $text) { [System.IO.File]::WriteAllBytes($path, (New-Object System.Text.UTF8Encoding($false)).GetBytes($text)) }
 
-Write-Host "GL-PATCH v4 installer for GEOlayers 3" -ForegroundColor Cyan
+Write-Host "GL-PATCH v4.1 installer for GEOlayers 3" -ForegroundColor Cyan
 
 if (-not (Test-Path -LiteralPath $blockFile)) { Fail "glsafe_v4.js not found next to this script." }
 $block = (ReadText $blockFile).TrimEnd()
-if (-not $block.StartsWith("/* GL-PATCH v4") -or -not $block.EndsWith("})();")) { Fail "glsafe_v4.js looks damaged." }
+if (-not $block.StartsWith("/* GL-PATCH v4.1") -or -not $block.EndsWith("})();")) { Fail "glsafe_v4.js looks damaged." }
 
 # ---- find the GEOlayers extension -------------------------------------------------
 if (-not $ExtensionDir) {
@@ -66,24 +66,27 @@ if (Get-Process -Name "AfterFX" -ErrorAction SilentlyContinue) { Fail "After Eff
 # ---- check current state ----------------------------------------------------------
 $libsText = ReadText $libs
 $mainText = ReadText $main
-if ($libsText.StartsWith("/* GL-PATCH v4")) {
-  Write-Host "`nGL-PATCH v4 is already installed. Nothing to do." -ForegroundColor Green
+$cut = $libsText.IndexOf($BlockEnd)
+$mainDone = $mainText.Contains($NewCall) -and -not $mainText.Contains($OldCall)
+if ($cut -ge 0 -and $libsText.Substring(0, $cut + 5) -eq $block -and $mainDone) {
+  Write-Host "`nGL-PATCH v4.1 is already installed. Nothing to do." -ForegroundColor Green
   if (-not $Yes) { Read-Host "Press Enter to close" | Out-Null }; exit 0
 }
-if (-not $libsText.StartsWith("/* GL-PATCH v3")) { Fail "js\libs.js is not in the GL-PATCH v3 state this installer expects (maybe GEOlayers was updated)." }
-$cut = $libsText.IndexOf($BlockEnd)
-if ($cut -lt 0) { Fail "Could not find the end of the v3 block in js\libs.js." }
+if ($libsText.StartsWith("/* GL-PATCH v3")) { $from = "v3" }
+elseif ($libsText.StartsWith("/* GL-PATCH v4")) { $from = "v4" }
+else { Fail "js\libs.js does not start with a GL-PATCH v3/v4 block (maybe GEOlayers was updated)." }
+if ($cut -lt 0) { Fail "Could not find the end of the GL-PATCH block in js\libs.js." }
 $calls = ([regex]::Matches($mainText, [regex]::Escape($OldCall))).Count
-if ($calls -ne 1) { Fail "js\main.js: expected exactly 1 tile-write call site, found $calls." }
+if (-not $mainDone -and $calls -ne 1) { Fail "js\main.js: expected exactly 1 tile-write call site, found $calls." }
 
 if (-not $Yes) {
-  Write-Host "`nThis will upgrade GL-PATCH v3 -> v4 (backup is made first)."
+  Write-Host "`nThis will upgrade GL-PATCH $from -> v4.1 (backup is made first)."
   if ((Read-Host "Continue? (y/n)") -notmatch "^[yY]") { Write-Host "Cancelled."; exit 0 }
 }
 
 # ---- backup -----------------------------------------------------------------------
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$backup = Join-Path $ExtensionDir "gl-patch-backup-v3-$stamp"
+$backup = Join-Path $ExtensionDir "gl-patch-backup-$from-$stamp"
 New-Item -ItemType Directory -Path $backup | Out-Null
 Copy-Item -LiteralPath $libs -Destination $backup
 Copy-Item -LiteralPath $main -Destination $backup
@@ -92,7 +95,7 @@ Write-Host "Backup: $backup"
 
 # ---- patch ------------------------------------------------------------------------
 $newLibs = $block + $libsText.Substring($cut + 5)
-$newMain = $mainText.Replace($OldCall, $NewCall)
+$newMain = if ($mainDone) { $mainText } else { $mainText.Replace($OldCall, $NewCall) }
 try {
   WriteText $libs $newLibs
   WriteText $main $newMain
@@ -104,8 +107,8 @@ try {
 
 # ---- verify -----------------------------------------------------------------------
 $chkLibs = ReadText $libs; $chkMain = ReadText $main
-$okLibs = $chkLibs.StartsWith("/* GL-PATCH v4") -and $chkLibs.Contains("writeCanvasAtomic:writeCanvasAtomic") -and $chkLibs.EndsWith($libsText.Substring($cut + 5))
-$okMain = $chkMain.Contains($NewCall) -and -not $chkMain.Contains($OldCall) -and $chkMain.Length -eq ($mainText.Length + $NewCall.Length - $OldCall.Length)
+$okLibs = $chkLibs.StartsWith("/* GL-PATCH v4.1") -and $chkLibs.Contains("writeCanvasAtomic:writeCanvasAtomic") -and $chkLibs.EndsWith($libsText.Substring($cut + 5))
+$okMain = $chkMain.Contains($NewCall) -and -not $chkMain.Contains($OldCall) -and $chkMain.Length -eq $newMain.Length
 if (-not ($okLibs -and $okMain)) {
   Copy-Item -LiteralPath (Join-Path $backup "libs.js") -Destination $libs -Force
   Copy-Item -LiteralPath (Join-Path $backup "main.js") -Destination $main -Force
@@ -114,14 +117,14 @@ if (-not ($okLibs -and $okMain)) {
 
 $note = Join-Path $ExtensionDir "gl-patch-installed.txt"
 $info = @"
-GL-PATCH v4 (full PNG validation + re-encode on corruption) installed $(Get-Date -Format s)
+GL-PATCH v4.1 (full PNG validation + canvas.toDataURL guard) installed $(Get-Date -Format s)
 js/main.js SHA256 $(Sha $main)
 js/libs.js SHA256 $(Sha $libs)
-previous (v3) files backed up in: $backup
+previous ($from) files backed up in: $backup
 rollback: run Uninstall-GlPatchV4.ps1 (as administrator)
 "@
 WriteText $note $info
-Write-Host "`nGL-PATCH v4 installed and verified." -ForegroundColor Green
-Write-Host "Start After Effects again. Log: %APPDATA%\aescripts\GEOlayers3\gl-patch.log (look for 'loaded v4')."
+Write-Host "`nGL-PATCH v4.1 installed and verified." -ForegroundColor Green
+Write-Host "Start After Effects again. Log: %APPDATA%\aescripts\GEOlayers3\gl-patch.log (look for 'loaded v4.1 ... canvas guard on')."
 if (-not $Yes) { Read-Host "Press Enter to close" | Out-Null }
 exit 0

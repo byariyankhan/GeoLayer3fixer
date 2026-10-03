@@ -419,10 +419,11 @@ def glpatch_status() -> list[tuple[str, str]]:
                     if "geolayers" not in f.read().lower():
                         continue
                 with open(libs, "rb") as f:
-                    head = f.read(16)
+                    head = f.read(20)
             except OSError:
                 continue
-            state = ("v4" if head.startswith(b"/* GL-PATCH v4") else
+            state = ("v4.1" if head.startswith(b"/* GL-PATCH v4.1") else
+                     "v4.0" if head.startswith(b"/* GL-PATCH v4") else
                      "v3" if head.startswith(b"/* GL-PATCH v3") else
                      "none" if not head.startswith(b"/* GL-PATCH") else "unknown")
             out.append((d, state))
