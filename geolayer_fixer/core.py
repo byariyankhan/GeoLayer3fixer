@@ -377,16 +377,56 @@ def _quarantine_name(name: str) -> str:
     return f"{int(time.time() * 1000)}_{base}"
 
 
-def quarantine(path: Path, qdir: Path) -> str:
+def quarantine(path: Path, qdir: Path, retries: int = 12) -> str:
+    """Move a broken tile out of GEOlayers' folders. After Effects often still
+    has the file open right after failing on it (WinError 32), so keep trying
+    for ~10 s before giving up."""
     qdir.mkdir(parents=True, exist_ok=True)
     dest = qdir / _quarantine_name(path.name)
-    try:
-        os.replace(path, dest)
-    except OSError:
-        import shutil  # different drive -> copy + delete
-        shutil.move(str(path), str(dest))
+    for i in range(retries):
+        try:
+            os.replace(path, dest)
+            break
+        except PermissionError:
+            if i == retries - 1:
+                raise
+            time.sleep(0.15 * (i + 1))
+        except OSError:
+            import shutil  # different drive -> copy + delete
+            shutil.move(str(path), str(dest))
+            break
     os.utime(dest)  # age counts from quarantine time
     return str(dest)
+
+
+def glpatch_status() -> list[tuple[str, str]]:
+    """[(extension folder, 'v4' | 'v3' | 'none' | 'unknown')] for every GEOlayers
+    CEP install found. GL-PATCH v4 stops broken tiles before they reach disk."""
+    roots = [os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Common Files", "Adobe", "CEP", "extensions"),
+             os.path.join(os.environ.get("ProgramFiles", ""), "Common Files", "Adobe", "CEP", "extensions"),
+             os.path.join(os.environ.get("APPDATA", ""), "Adobe", "CEP", "extensions")]
+    out = []
+    for r in roots:
+        try:
+            dirs = [os.path.join(r, d) for d in os.listdir(r)]
+        except OSError:
+            continue
+        for d in dirs:
+            libs = os.path.join(d, "js", "libs.js")
+            man = os.path.join(d, "CSXS", "manifest.xml")
+            try:
+                with open(man, encoding="utf-8", errors="replace") as f:
+                    if "geolayers" not in f.read().lower():
+                        continue
+                with open(libs, "rb") as f:
+                    head = f.read(16)
+            except OSError:
+                continue
+            state = ("v4" if head.startswith(b"/* GL-PATCH v4") else
+                     "v3" if head.startswith(b"/* GL-PATCH v3") else
+                     "none" if not head.startswith(b"/* GL-PATCH") else "unknown")
+            out.append((d, state))
+    return out
 
 
 def process_file(path: str, force: bool = False, dry_run: bool = False,

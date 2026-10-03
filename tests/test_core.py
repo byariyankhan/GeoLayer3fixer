@@ -263,3 +263,38 @@ def test_quarantine_name_never_grows(tmp_path, isolated_appdata):
     (q,) = (isolated_appdata / "quarantine").iterdir()
     assert q.name.endswith("_esri-muowx25av9p7l_1024_6_12021.png")
     assert len(q.name) == 14 + len("esri-muowx25av9p7l_1024_6_12021.png")
+
+
+def test_quarantine_retries_while_file_locked(tmp_path, isolated_appdata, monkeypatch):
+    """AE keeps a tile open right after failing on it (WinError 32)."""
+    import geolayer_fixer.core as core
+    f = tmp_path / "tiles" / "locked.png"
+    f.parent.mkdir()
+    f.write_bytes(truncated(make_png()))
+    real, calls = os.replace, {"n": 0}
+
+    def flaky_replace(a, b):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise PermissionError(32, "being used by another process")
+        return real(a, b)
+
+    monkeypatch.setattr(core.os, "replace", flaky_replace)
+    r = process_file(str(f))
+    assert r.status == "quarantined", r
+    assert calls["n"] == 4
+
+
+def test_glpatch_status(tmp_path, monkeypatch):
+    from geolayer_fixer.core import glpatch_status
+    ext = tmp_path / "pf" / "Common Files" / "Adobe" / "CEP" / "extensions"
+    for name, head in (("GEO v4", "/* GL-PATCH v4 x */"), ("GEO v3", "/* GL-PATCH v3 x */"), ("GEO plain", "!function(){}")):
+        (ext / name / "js").mkdir(parents=True)
+        (ext / name / "CSXS").mkdir()
+        (ext / name / "CSXS" / "manifest.xml").write_text("<X Name='GEOlayers 3'/>")
+        (ext / name / "js" / "libs.js").write_text(head)
+    (ext / "Other" / "CSXS").mkdir(parents=True)
+    (ext / "Other" / "CSXS" / "manifest.xml").write_text("<X Name='Lottie'/>")
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "pf"))
+    st = {os.path.basename(d): s for d, s in glpatch_status()}
+    assert st == {"GEO v4": "v4", "GEO v3": "v3", "GEO plain": "none"}

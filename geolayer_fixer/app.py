@@ -14,7 +14,7 @@ from tkinter import filedialog
 import customtkinter as ctk
 
 from . import __version__
-from .core import app_dir, clean_quarantine, default_folders, quarantine_dir
+from .core import app_dir, clean_quarantine, default_folders, glpatch_status, quarantine_dir
 from .runner import VerifiedCache, Watcher, pick_workers, run_batch, set_high_priority
 
 APP_DIR = str(app_dir())
@@ -160,6 +160,12 @@ class App(ctk.CTk):
         old = repoint_old_autostart()
         if old:
             self._log(f"Start-with-Windows was launching an old fixer ({old}). Switched it to this version.")
+        for ext, state in glpatch_status():
+            if state == "v4":
+                self._log(f"GL-PATCH v4 active in GEOlayers - broken tiles are stopped before they reach disk.")
+            else:
+                self._log(f"GEOlayers has GL-PATCH {state}: install GL-PATCH v4 (Releases page) so broken tiles "
+                          f"never reach After Effects. ({ext})")
         removed = clean_quarantine(days=7)
         if removed:
             self._log(f"Deleted {removed} quarantined tile(s) older than 7 days.")

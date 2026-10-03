@@ -27,6 +27,10 @@ jobs:
       - name: Test
         run: python -m pytest -q tests
 
+      - name: Test GL-PATCH v4 installer (fake GEOlayers extension)
+        shell: pwsh
+        run: ./gl-patch/ci_test_installer.ps1
+
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
@@ -45,10 +49,16 @@ jobs:
           python tests/smoke_exe.py check smoke
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Package GL-PATCH v4
+        shell: pwsh
+        run: Compress-Archive -Path gl-patch/glsafe_v4.js, gl-patch/Install-GlPatchV4.ps1, gl-patch/Uninstall-GlPatchV4.ps1, gl-patch/install.cmd -DestinationPath dist/GL-PATCH-v4.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: GeoLayer_Fixer
-          path: dist/GeoLayer_Fixer.exe
+          path: |
+            dist/GeoLayer_Fixer.exe
+            dist/GL-PATCH-v4.zip
 
       - name: Read version
         id: ver
@@ -70,7 +80,10 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: GeoLayer Fixer v${{ steps.ver.outputs.v }}
           body: |
-            Download **GeoLayer_Fixer.exe** below.
-            Close the old v1 fixer first. Then: keep Auto Watcher on, click Fix Tiles Now before render,
-            and in AE use Edit > Purge > All Memory & Disk Cache.
-          files: dist/GeoLayer_Fixer.exe
+            **GeoLayer_Fixer.exe** - watches the GEOlayers tile cache and repairs/quarantines broken tiles.
+            **GL-PATCH-v4.zip** - patch for GEOlayers 3 itself: stops broken tiles before they are written
+            (needs GL-PATCH v3; close After Effects, unzip, double-click install.cmd).
+            See gl-patch/README.md.
+          files: |
+            dist/GeoLayer_Fixer.exe
+            dist/GL-PATCH-v4.zip
