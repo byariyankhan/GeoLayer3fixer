@@ -14,6 +14,7 @@ $h0 = (Get-FileHash "$ext\js\libs.js").Hash, (Get-FileHash "$ext\js\main.js").Ha
 function Ann($text) { ($text -replace "%", "%25" -replace "`r", "" -replace "`n", "%0A") }
 function Check($cond, $msg) { if (-not $cond) { Write-Host "::error::FAIL: $msg"; exit 1 } else { Write-Host "::notice::ok - $msg" } }
 function Run($script, [string[]]$extra) {
+  $ErrorActionPreference = "Continue"
   $out = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here $script) -ExtensionDir $ext -Yes @extra 2>&1 | Out-String
   $code = $LASTEXITCODE
   Write-Host "::notice::$script exit $code%0A$(Ann $out)"
