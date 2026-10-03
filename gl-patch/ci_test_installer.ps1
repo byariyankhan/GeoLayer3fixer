@@ -11,10 +11,17 @@ $main = "a();x=glSafeImageFile.writeDataUriAtomic(r,n+`".`"+i).then(f);b('ä');`
 [IO.File]::WriteAllText("$ext\js\main.js", $main, $enc)
 $h0 = (Get-FileHash "$ext\js\libs.js").Hash, (Get-FileHash "$ext\js\main.js").Hash
 
-function Check($cond, $msg) { if (-not $cond) { Write-Host "FAIL: $msg"; exit 1 } else { Write-Host "ok - $msg" } }
+function Ann($text) { ($text -replace "%", "%25" -replace "`r", "" -replace "`n", "%0A") }
+function Check($cond, $msg) { if (-not $cond) { Write-Host "::error::FAIL: $msg"; exit 1 } else { Write-Host "::notice::ok - $msg" } }
+function Run($script, [string[]]$extra) {
+  $out = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here $script) -ExtensionDir $ext -Yes @extra 2>&1 | Out-String
+  $code = $LASTEXITCODE
+  Write-Host "::notice::$script exit $code%0A$(Ann $out)"
+  return $code
+}
 
-& powershell -NoProfile -ExecutionPolicy Bypass -File "$here\Install-GlPatchV4.ps1" -ExtensionDir $ext -Yes
-Check ($LASTEXITCODE -eq 0) "install exit code 0"
+$code = Run "Install-GlPatchV4.ps1"
+Check ($code -eq 0) "install exit code 0"
 $libs = [IO.File]::ReadAllText("$ext\js\libs.js", $enc)
 $mainNew = [IO.File]::ReadAllText("$ext\js\main.js", $enc)
 Check ($libs.StartsWith("/* GL-PATCH v4")) "libs.js has v4 block"
@@ -23,17 +30,17 @@ Check ($mainNew -eq "a();x=glSafeImageFile.writeCanvasAtomic(p,u,m,r,n+`".`"+i).
 Check (Test-Path "$ext\gl-patch-installed.txt") "install note written"
 Check ((Get-ChildItem $ext -Directory -Filter "gl-patch-backup-v3-*").Count -eq 1) "backup created"
 
-& powershell -NoProfile -ExecutionPolicy Bypass -File "$here\Install-GlPatchV4.ps1" -ExtensionDir $ext -Yes
-Check ($LASTEXITCODE -eq 0) "second install is a no-op"
+$code = Run "Install-GlPatchV4.ps1"
+Check ($code -eq 0) "second install is a no-op"
 Check ((Get-ChildItem $ext -Directory -Filter "gl-patch-backup-v3-*").Count -eq 1) "no second backup"
 
-& powershell -NoProfile -ExecutionPolicy Bypass -File "$here\Uninstall-GlPatchV4.ps1" -ExtensionDir $ext -Yes
+$code = Run "Uninstall-GlPatchV4.ps1"
 Check ((Get-FileHash "$ext\js\libs.js").Hash -eq $h0[0] -and (Get-FileHash "$ext\js\main.js").Hash -eq $h0[1]) "uninstall restores v3 byte-for-byte"
 
 # unknown state (e.g. GEOlayers updated, no patch) -> refuses and changes nothing
 [IO.File]::WriteAllText("$ext\js\libs.js", "!function o(n){}();`n", $enc)
 $before = (Get-FileHash "$ext\js\libs.js").Hash
-& powershell -NoProfile -ExecutionPolicy Bypass -File "$here\Install-GlPatchV4.ps1" -ExtensionDir $ext -Yes
-Check ($LASTEXITCODE -eq 1) "unknown libs.js state -> exit 1"
+$code = Run "Install-GlPatchV4.ps1"
+Check ($code -eq 1) "unknown libs.js state -> exit 1"
 Check ((Get-FileHash "$ext\js\libs.js").Hash -eq $before) "unknown state left untouched"
 Write-Host "gl-patch installer tests passed"
